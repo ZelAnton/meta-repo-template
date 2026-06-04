@@ -8,6 +8,15 @@ into a concrete per-language template such as `go-repo-template` or
 > generated template when you finish — they describe the authoring step, not the
 > shipped template.
 
+> **GitHub Actions is disabled on this meta-repo — on purpose.** The repo ships the
+> template's `ci.yml` / `codeql.yml` with `exit 1` placeholders (filled per-language),
+> so they cannot pass here: the meta-repo has no buildable project. Actions is
+> therefore turned off for it (Settings → Actions → *Disable*, or `gh api -X PUT
+> repos/<owner>/<repo>/actions/permissions -F enabled=false`) so pushes don't log a
+> red run. A **generated template is a separate repo with Actions on by default**, so
+> its CI runs normally once the workflow steps are filled — do not copy this setting
+> forward. Lint the meta-repo's own YAML locally with `yamllint .`.
+
 ## 1. What this is, and the two-token model
 
 `meta-repo-template` mirrors the file tree of a real language template
