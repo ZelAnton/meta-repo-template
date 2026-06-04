@@ -1,0 +1,57 @@
+# META(%%): OPTIONAL — keep this file ONLY if GitHub CodeQL supports your language.
+#   Supported (keep): C# (csharp), Kotlin/Java (java-kotlin), JavaScript/TypeScript,
+#     Python, Go, Ruby, C/C++, Swift.
+#   Unsupported (DELETE this file): Rust, F#, and anything not in CodeQL's list.
+# Fill %%CodeqlLanguage%% (the CodeQL identifier) and the build steps, then update
+# SECURITY.md accordingly. See META-AUTHORING.md.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '32 5 * * 1'
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (%%LangName%%)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+      # Actions are pinned to a full commit SHA (supply-chain hardening); the
+      # trailing comment records the human-readable version.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      # META(%%): set up the %%LangName%% toolchain (same action as ci.yml), pinned to a SHA.
+      - name: Set up %%LangName%% toolchain
+        run: |
+          echo "TODO(meta): install the %%BuildTool%% toolchain (see META-AUTHORING.md)"
+          exit 1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4
+        with:
+          languages: "%%CodeqlLanguage%%"
+          queries: security-and-quality
+          build-mode: manual
+
+      # META(%%): an explicit build for CodeQL's manual build-mode.
+      - name: Build
+        run: |
+          echo "TODO(meta): build for CodeQL — see META-AUTHORING.md (%%BuildCmd%%)"
+          exit 1
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4
+        with:
+          category: "/language:%%CodeqlLanguage%%"

@@ -1,0 +1,53 @@
+# META(%%): the core rules below are language-neutral. Set the source-file
+# indentation for your language (most use 4 spaces; .NET/C# uses tabs) and add a
+# style block for [*.%%FileExt%%] if the language has editor-enforced style.
+# See META-AUTHORING.md. Leave the YAML / Markdown / batch / PowerShell blocks as-is.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+# Default indentation. Spaces/4 suits Rust, F#, Kotlin, Go, Python, …; the .NET
+# templates override this to tabs. Pick what is idiomatic for %%LangName%%.
+indent_style = space
+indent_size = 4
+tab_width = 4
+
+# META(%%): primary source files. Add language style rules here if applicable
+# (e.g. csharp_* / dotnet_* for C#; ktlint_* for Kotlin). Delete if the language's
+# formatter (rustfmt, Fantomas, gofmt, …) owns style instead of .editorconfig.
+[*.%%FileExt%%]
+indent_style = space
+indent_size = 4
+tab_width = 4
+
+# Config files (TOML, JSON, build manifests). Adjust the extension list to match
+# your build system (e.g. add csproj/props/targets for .NET, gradle.kts for Gradle).
+# YAML has its own section below.
+[*.{toml,json}]
+indent_style = space
+indent_size = 2
+tab_width = 2
+
+# Windows batch files must have CRLF — CMD will not parse them otherwise.
+[*.{bat,cmd}]
+end_of_line = crlf
+tab_width = 2
+
+# PowerShell (the init scripts) — spaces, LF.
+[*.{ps1,psm1,psd1}]
+indent_style = space
+indent_size = 4
+tab_width = 4
+
+# YAML cannot use tabs.
+[*.{yaml,yml}]
+indent_style = space
+indent_size = 2
+tab_width = 2
+
+# Markdown — keep trailing whitespace (hard line breaks).
+[*.md]
+trim_trailing_whitespace = false
