@@ -1,0 +1,60 @@
+## -------
+## Build artifacts
+## META(%%): replace with your build system's output/cache dirs.
+##   Rust: /target   ·   .NET: [Bb]in/ [Oo]bj/   ·   Gradle: build/ .gradle/
+##   plus any package/lock scratch (e.g. *.nupkg, packages/). See META-AUTHORING.md.
+## -------
+%%BuildArtifactDirs%%
+
+# Release pipeline scratch file — written by .github/workflows/release.yml
+release-notes.md
+
+## -------
+## Editors / IDEs
+## -------
+.vs/
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+*.code-workspace
+.history/
+.idea/
+
+## -------
+## Secrets / local config
+## -------
+.env
+.env.local
+
+## -------
+## macOS
+## -------
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+## -------
+## Windows
+## -------
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+## -------
+## Claude Code — ship the shared settings with the repo, even if a global
+## gitignore excludes .claude. Personal overrides stay ignored.
+## -------
+!.claude/
+.claude/*
+!.claude/settings.json
+!.claude/settings.json.template
+.claude/settings.local.json

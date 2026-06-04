@@ -1,0 +1,9 @@
+// META(%%): replace this whole file with a sample public API written in %%LangName%%,
+// and rename it to Greeter.%%FileExt%% (the meta-token in the filename must become the
+// real extension — e.g. Greeter.cs / Greeter.rs / Greeter.fs / Greeter.kt).
+//
+// It should expose one trivial function so the template builds and the sample test
+// passes out of the box, e.g. Greet(name) => "Hello, {name}!". Use __ProjectName__ for
+// the namespace/module/crate name and leave that token literal — the init script
+// resolves it. See the sibling templates (rust/cSharp/fSharp/kotlin) for the idiomatic
+// form, and META-AUTHORING.md for the source-layout notes (%%SrcLayout%%).

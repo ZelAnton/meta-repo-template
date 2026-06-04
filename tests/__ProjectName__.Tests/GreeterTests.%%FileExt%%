@@ -1,0 +1,8 @@
+// META(%%): replace this whole file with a sample test in %%LangName%%, and rename it
+// to GreeterTests.%%FileExt%%. It should assert the sample Greeter API (e.g.
+// Greet("World") == "Hello, World!") using the language's test framework, so
+// `%%TestCmd%%` discovers and runs at least one passing test out of the box.
+//
+// Use __ProjectName__ for the namespace/module name (leave the token literal). For
+// non-.NET layouts, place this file where the language expects tests and adjust the
+// tests/__ProjectName__.Tests/ folder accordingly — see META-AUTHORING.md.

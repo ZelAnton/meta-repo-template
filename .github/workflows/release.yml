@@ -1,0 +1,417 @@
+# META(%%): KEEP the release ordering and every neutral step (guard, preflight,
+# App token, version math, git-cliff auto-fill, release-notes extraction, Unreleased
+# promotion, local commit+tag, atomic push, GitHub Release). Fill only the marked
+# language-specific steps (toolchain setup, build/test, pack, version-bump, publish)
+# and the meta-tokens. NEVER move the publish after the tag push — see the ordering
+# invariant below and META-AUTHORING.md.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: 'patch'
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # RELEASE ORDERING INVARIANT (rationale repeated at each relevant step):
+      # publishing to the package registry is the single IRREVERSIBLE step, so it is
+      # the pivot. Everything before it is cheap and reversible (build/test/pack, plus
+      # a LOCAL commit+tag that is not yet pushed); everything after it (push the
+      # commit+tag to main, create the GitHub Release) is reversible/recreatable and is
+      # made idempotent + retried. A failure before the pivot leaves no trace on the
+      # remote or registry — just re-run. A failure after the pivot is recoverable by
+      # re-run, EXCEPT once the tag is on main (see the Release step's note).
+      #
+      # The "Push the release commit + tag" step pushes straight to main. If you
+      # protect main with a rule that requires pull requests or status checks, that
+      # push is rejected unless the pusher can bypass it. This workflow mints a
+      # short-lived GitHub App token (repo variable RELEASE_APP_ID + secret
+      # RELEASE_APP_PRIVATE_KEY) and checks out with it, so the push runs as the App
+      # — add that App to the ruleset's bypass list. Until it is configured the
+      # checkout falls back to GITHUB_TOKEN (fine while main is unprotected). Recipe:
+      # release-token-bypass.md.
+      # Actions are pinned to a full commit SHA (supply-chain hardening); the
+      # trailing comment records the human-readable version. Dependabot bumps the
+      # SHA and updates the comment on its weekly run.
+
+      - name: Guard — release only from main
+        run: |
+          set -euo pipefail
+          # Read the dispatch ref from $GITHUB_REF (not an interpolated expression) to
+          # avoid script injection via a crafted branch name. Standard Actions guard.
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Release must be dispatched from main (got: $GITHUB_REF). Re-run with 'Use workflow from: main'."
+            exit 1
+          fi
+          echo "Dispatched from main."
+
+      - name: Preflight — required secrets present before any external action
+        env:
+          # META(%%): name of the registry push credential, e.g. NUGET_API_KEY /
+          # CARGO_REGISTRY_TOKEN / MAVEN_CENTRAL_PASSWORD (+ signing secrets).
+          PUBLISH_SECRET: ${{ secrets.%%PublishSecret%% }}
+        run: |
+          set -euo pipefail
+          # Fail fast, before any irreversible publish or VCS push, if the publish
+          # credential is missing.
+          if [[ -z "${PUBLISH_SECRET:-}" ]]; then
+            echo "::error::%%PublishSecret%% secret is not set. Add it under Settings -> Secrets and variables -> Actions before releasing."
+            exit 1
+          fi
+          echo "Required secrets present."
+
+      # Mint a short-lived GitHub App installation token so the push to `main` runs as
+      # the App (which sits in the branch-protection ruleset's bypass list). Skipped
+      # until RELEASE_APP_ID is set; then the push falls back to GITHUB_TOKEN. See
+      # release-token-bypass.md.
+      - name: Mint GitHub App token
+        id: app-token
+        if: ${{ vars.RELEASE_APP_ID != '' }}
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      # META(%%): set up the %%LangName%% toolchain here, pinned to a SHA (same action
+      # you used in ci.yml).
+      - name: Set up %%LangName%% toolchain
+        run: |
+          echo "TODO(meta): install the %%BuildTool%% toolchain (see META-AUTHORING.md)"
+          exit 1
+
+      - name: Determine next version
+        id: version
+        run: |
+          set -euo pipefail
+          LATEST_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+          if [[ -n "$LATEST_TAG" ]]; then
+            CURRENT="${LATEST_TAG#v}"
+            if [[ ! "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Could not parse current version from tag (got: '$CURRENT')"
+              exit 1
+            fi
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+            case "${{ inputs.bump }}" in
+              major) NEW="$((MAJOR+1)).0.0" ;;
+              minor) NEW="${MAJOR}.$((MINOR+1)).0" ;;
+              patch) NEW="${MAJOR}.${MINOR}.$((PATCH+1))" ;;
+            esac
+            echo "Latest release tag: $LATEST_TAG (current=$CURRENT); ${{ inputs.bump }} bump -> $NEW"
+          else
+            # First release: seed the version straight from the build manifest so the
+            # published version matches what the repo declares. The bump input is ignored.
+            # META(%%): extract the current version from %%ManifestFile%%. Examples:
+            #   .NET   → grep -oP '(?<=<Version>)[^<]+' %%ManifestPath%% | head -n1
+            #   Rust   → grep -oP '(?<=^version = ")[^"]+' Cargo.toml | head -n1
+            #   Gradle → read the `version` property / gradle.properties
+            CURRENT="0.0.0"
+            NEW=$(%%VersionSeedCmd%%)
+            echo "No release tags found; seeding first release from manifest version=$NEW (bump input ignored)."
+          fi
+          if [[ ! "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Computed version '$NEW' is not a valid MAJOR.MINOR.PATCH semver."
+            exit 1
+          fi
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag does not exist
+        run: |
+          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "::error::Tag ${{ steps.version.outputs.tag }} already exists"
+            exit 1
+          fi
+
+      # git-cliff (next step) needs the previous tag locally to bound its commit range.
+      # When it is missing (synthetic v0.0.0 of a first release) create it locally and
+      # DO NOT push it — pushing would be a remote write before the pivot and would
+      # break first-release re-run safety.
+      - name: Ensure previous tag exists (local only)
+        env:
+          PREV_TAG: v${{ steps.version.outputs.current }}
+        run: |
+          set -euo pipefail
+          if git rev-parse "$PREV_TAG" >/dev/null 2>&1; then
+            echo "Previous tag $PREV_TAG already exists."
+            exit 0
+          fi
+          ROOT=$(git rev-list --max-parents=0 HEAD | tail -n1)
+          echo "Previous tag $PREV_TAG does not exist; creating it locally at root commit $ROOT (not pushed)."
+          git tag "$PREV_TAG" "$ROOT"
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2
+        with:
+          tool: git-cliff@2
+
+      - name: Auto-fill [Unreleased] from git log if empty
+        env:
+          PREV_TAG: v${{ steps.version.outputs.current }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          prev_tag = os.environ["PREV_TAG"]
+          path = pathlib.Path("CHANGELOG.md")
+          text = path.read_text()
+
+          m = re.search(r"^## \[Unreleased\]\s*\n(.*?)(?=^## \[|\Z)", text, re.M | re.S)
+          if not m:
+              print("::error::Could not find '## [Unreleased]' header in CHANGELOG.md", file=sys.stderr)
+              sys.exit(1)
+
+          body = m.group(1)
+          has_real_bullets = any(re.match(r"^-\s+\S", ln) for ln in body.splitlines())
+          if has_real_bullets:
+              print("[Unreleased] already has manual entries; skipping auto-fill.")
+              sys.exit(0)
+
+          print(f"[Unreleased] is empty; generating from git log since {prev_tag}...")
+          result = subprocess.run(
+              ["git-cliff", "--config", "cliff.toml", "--strip", "all", f"{prev_tag}..HEAD"],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          generated = result.stdout.strip()
+          if not generated:
+              print(
+                  f"::error::No release-worthy commits found between {prev_tag} and HEAD. "
+                  "Either add a manual entry to [Unreleased] in CHANGELOG.md, or commit "
+                  "changes with a recognised prefix (Add/Fix/Refactor/Update/Remove/...).",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          new_text = text[: m.start(1)] + generated + "\n\n" + text[m.end(1) :]
+          path.write_text(new_text)
+          print("----- auto-generated [Unreleased] body -----")
+          print(generated)
+          print("--------------------------------------------")
+          PY
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          text = pathlib.Path("CHANGELOG.md").read_text()
+          m = re.search(r"^## \[Unreleased\]\s*\n(.*?)(?=^## \[|\Z)", text, re.M | re.S)
+          body = (m.group(1) if m else "").strip()
+
+          # Keep "### Header" only if it has at least one real bullet ("- text").
+          parts = re.split(r"(?m)(^### .+$)", body)
+          out = []
+          for i in range(1, len(parts), 2):
+              header = parts[i]
+              section = parts[i + 1] if i + 1 < len(parts) else ""
+              bullets = [ln for ln in section.splitlines() if re.match(r"^-\s+\S", ln)]
+              if bullets:
+                  if out:
+                      out.append("")
+                  out.append(header)
+                  out.extend(bullets)
+
+          result = "\n".join(out).strip()
+          if not result:
+              print(
+                  "::error::[Unreleased] section in CHANGELOG.md is empty. "
+                  "Add release notes before releasing.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          pathlib.Path("release-notes.md").write_text(result + "\n")
+          print("----- release-notes.md -----")
+          print(result)
+          print("----------------------------")
+          PY
+
+      # META(%%): build, test, and produce the publishable artifacts into ./artifacts.
+      # Pass the computed version (${{ steps.version.outputs.version }}) into the build
+      # so the packaged version matches the tag. Examples:
+      #   .NET   → dotnet build/test then `dotnet pack --output ./artifacts /p:Version=...`
+      #   Rust   → `cargo build/test` (publish happens at the pivot; no separate pack)
+      #   Gradle → `./gradlew build -Pversion=... ` then collect jars into ./artifacts
+      - name: Build, test, and package
+        run: |
+          echo "TODO(meta): build, test, and package into ./artifacts — see META-AUTHORING.md"
+          echo "  build: %%BuildCmd%% ; test: %%TestCmd%%"
+          exit 1
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p ./artifacts
+          cd ./artifacts
+          files=(*)
+          # Drop a pre-existing SHA256SUMS from the glob so it doesn't hash itself.
+          files=("${files[@]/SHA256SUMS}")
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "::error::No artifacts to hash in ./artifacts. Did the package step run?"
+            exit 1
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      # META(%%): write the computed version back into %%ManifestFile%% so the release
+      # commit records it. Example (.NET):
+      #   sed -i -E "s|<Version>[^<]+</Version>|<Version>${{ steps.version.outputs.version }}</Version>|" %%ManifestPath%%
+      - name: Bump version in manifest
+        run: |
+          echo "TODO(meta): persist version ${{ steps.version.outputs.version }} into %%ManifestFile%% (see META-AUTHORING.md)"
+          exit 1
+
+      - name: Promote Unreleased section in CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PREV_TAG: v${{ steps.version.outputs.current }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+          from datetime import datetime, timezone
+
+          version = os.environ["VERSION"]
+          tag = os.environ["TAG"]
+          prev_tag = os.environ["PREV_TAG"]
+          date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+          repo = "https://github.com/__GitHubOwner__/__ProjectName__"
+
+          path = pathlib.Path("CHANGELOG.md")
+          text = path.read_text()
+
+          new_unreleased = (
+              "## [Unreleased]\n\n"
+              "### Added\n-\n\n"
+              "### Changed\n-\n\n"
+              "### Fixed\n-\n\n"
+              f"## [{version}] - {date}"
+          )
+          text, n = re.subn(r"^## \[Unreleased\]$", new_unreleased, text, count=1, flags=re.M)
+          if n != 1:
+              print("::error::Could not find '## [Unreleased]' header in CHANGELOG.md", file=sys.stderr)
+              sys.exit(1)
+
+          link_replacement = (
+              f"[Unreleased]: {repo}/compare/{tag}...HEAD\n"
+              f"[{version}]: {repo}/compare/{prev_tag}...{tag}"
+          )
+          text, n = re.subn(r"^\[Unreleased\]:.*$", link_replacement, text, count=1, flags=re.M)
+          if n != 1:
+              print("::error::Could not find '[Unreleased]: ...' reference link in CHANGELOG.md", file=sys.stderr)
+              sys.exit(1)
+
+          path.write_text(text)
+          PY
+
+      # Create the release commit and tag LOCALLY, but do NOT push yet: the push is a
+      # VCS write and must happen AFTER the irreversible publish (the pivot below).
+      - name: Commit and tag the release (local only)
+        run: |
+          set -euo pipefail
+          git config user.name "__Author__"
+          git config user.email "__AuthorEmail__"
+          # META(%%): add the manifest file(s) you bumped above alongside CHANGELOG.md.
+          git add %%ManifestPath%% CHANGELOG.md
+          git commit -m "Release ${{ steps.version.outputs.tag }}"
+          git tag "${{ steps.version.outputs.tag }}"
+
+      # === PIVOT: the single irreversible step ===
+      # Publishing to the registry cannot be undone, so it is the pivot and every
+      # reversible action is ordered around it. It runs BEFORE the git push and the
+      # GitHub Release: if it fails, no tag/commit has reached the remote and no Release
+      # exists, so a re-run is safe and recomputes the SAME version.
+      # META(%%): replace the publish command with your registry's. Make it idempotent
+      # so a re-run after a post-publish failure is a no-op (treat "already published"
+      # as success):
+      #   .NET   → dotnet nuget push "./artifacts/*.nupkg" --source ... --api-key "$PUBLISH_SECRET" --skip-duplicate
+      #   Rust   → cargo publish --locked   (idempotent: a re-push of an existing version errors; guard or accept)
+      #   Gradle → ./gradlew publish   (Maven Central via the configured plugin)
+      - name: Publish to %%RegistryName%% (irreversible pivot)
+        env:
+          PUBLISH_SECRET: ${{ secrets.%%PublishSecret%% }}
+        run: |
+          set -euo pipefail
+          # META(%%): %%PublishCmd%% is the real publish command (filled from the table
+          # above). The retry loop is neutral machinery — keep it.
+          for attempt in 1 2 3; do
+            if %%PublishCmd%%; then
+              echo "Publish succeeded (attempt $attempt)."
+              exit 0
+            fi
+            echo "::warning::Publish attempt $attempt failed; retrying after backoff..."
+            sleep $((attempt * 15))
+          done
+          echo "::error::Publish failed after 3 attempts. Nothing was pushed to the remote and no Release was created — it is safe to re-run this workflow."
+          exit 1
+
+      # Reversible VCS write, AFTER the pivot. --atomic guarantees the branch and tag
+      # move together (or neither does).
+      - name: Push the release commit + tag (atomic)
+        run: git push --atomic origin HEAD:refs/heads/main "${{ steps.version.outputs.tag }}"
+
+      # Final, recreatable step, made idempotent (edit the Release if it already exists,
+      # else create it) and retried.
+      - name: Create or update the GitHub Release (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(./artifacts/*)
+          for attempt in 1 2 3; do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              if gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md \
+                 && gh release upload "$TAG" "${assets[@]}" --clobber; then
+                echo "Updated existing Release $TAG (attempt $attempt)."
+                exit 0
+              fi
+            else
+              if gh release create "$TAG" --title "$TAG" --notes-file release-notes.md "${assets[@]}"; then
+                echo "Created Release $TAG (attempt $attempt)."
+                exit 0
+              fi
+            fi
+            echo "::warning::GitHub Release step attempt $attempt failed; retrying after backoff..."
+            sleep $((attempt * 10))
+          done
+          echo "::error::Failed to create/update the GitHub Release after 3 attempts. The package is ALREADY published and the tag is ALREADY on main. Do NOT re-run this workflow (a re-run computes the NEXT version and orphans this release). Finish by hand: 'gh release create $TAG --title $TAG --notes-file release-notes.md ./artifacts/*' (or 'gh release edit'/'gh release upload --clobber' if it already exists)."
+          exit 1
