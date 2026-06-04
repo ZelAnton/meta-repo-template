@@ -270,15 +270,24 @@ jobs:
           echo "  build: %%BuildCmd%% ; test: %%TestCmd%%"
           exit 1
 
+      # META(%%): this step + the artifact uploads in the Release step are for
+      # registries that publish DOWNLOADABLE files (.nupkg, .jar). A registry that
+      # publishes source directly (e.g. crates.io) produces none — DELETE this step
+      # and have the Release step attach notes only (see the Rust sibling).
       - name: Generate SHA256SUMS
         run: |
           set -euo pipefail
           shopt -s nullglob
           mkdir -p ./artifacts
           cd ./artifacts
-          files=(*)
-          # Drop a pre-existing SHA256SUMS from the glob so it doesn't hash itself.
-          files=("${files[@]/SHA256SUMS}")
+          # Hash every artifact except the manifest itself. Build the list with an
+          # explicit loop so excluding SHA256SUMS can't leave an empty array element
+          # (which would make `sha256sum ''` fail on a re-run where it already exists).
+          files=()
+          for f in *; do
+            [[ "$f" == SHA256SUMS ]] && continue
+            files+=("$f")
+          done
           if [[ ${#files[@]} -eq 0 ]]; then
             echo "::error::No artifacts to hash in ./artifacts. Did the package step run?"
             exit 1
@@ -358,11 +367,14 @@ jobs:
       # reversible action is ordered around it. It runs BEFORE the git push and the
       # GitHub Release: if it fails, no tag/commit has reached the remote and no Release
       # exists, so a re-run is safe and recomputes the SAME version.
-      # META(%%): replace the publish command with your registry's. Make it idempotent
-      # so a re-run after a post-publish failure is a no-op (treat "already published"
-      # as success):
+      # META(%%): replace the publish command with your registry's. It MUST be
+      # idempotent so a re-run after a post-publish failure is a no-op — treat "already
+      # published" as success, or the retry loop turns a successful publish into a
+      # failure on re-run:
       #   .NET   → dotnet nuget push "./artifacts/*.nupkg" --source ... --api-key "$PUBLISH_SECRET" --skip-duplicate
-      #   Rust   → cargo publish --locked   (idempotent: a re-push of an existing version errors; guard or accept)
+      #   Rust   → cargo publish --locked is NOT idempotent on its own (re-pushing an
+      #            existing version errors); capture its output and treat the "already
+      #            uploaded" message as success — see the Rust sibling's publish step.
       #   Gradle → ./gradlew publish   (Maven Central via the configured plugin)
       - name: Publish to %%RegistryName%% (irreversible pivot)
         env:
@@ -389,6 +401,9 @@ jobs:
 
       # Final, recreatable step, made idempotent (edit the Release if it already exists,
       # else create it) and retried.
+      # META(%%): `assets` are the downloadable files attached to the Release. For a
+      # source-only registry (crates.io) there are none — the empty-array guard below
+      # attaches notes only, so this step needs no edits in that case.
       - name: Create or update the GitHub Release (idempotent)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -398,17 +413,21 @@ jobs:
           shopt -s nullglob
           assets=(./artifacts/*)
           for attempt in 1 2 3; do
+            ok=0
             if gh release view "$TAG" >/dev/null 2>&1; then
-              if gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md \
-                 && gh release upload "$TAG" "${assets[@]}" --clobber; then
-                echo "Updated existing Release $TAG (attempt $attempt)."
-                exit 0
+              if gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md; then
+                if (( ${#assets[@]} == 0 )) || gh release upload "$TAG" "${assets[@]}" --clobber; then
+                  ok=1
+                fi
               fi
             else
               if gh release create "$TAG" --title "$TAG" --notes-file release-notes.md "${assets[@]}"; then
-                echo "Created Release $TAG (attempt $attempt)."
-                exit 0
+                ok=1
               fi
+            fi
+            if (( ok )); then
+              echo "Release $TAG published (attempt $attempt)."
+              exit 0
             fi
             echo "::warning::GitHub Release step attempt $attempt failed; retrying after backoff..."
             sleep $((attempt * 10))

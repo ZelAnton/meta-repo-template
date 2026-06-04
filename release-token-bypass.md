@@ -52,9 +52,9 @@ you turn on PR-required branch protection.
 ## Verifying
 
 Dispatch the release workflow (Actions → *Release* → *Run workflow* → pick a
-bump). The **Mint GitHub App token** step should run (not skip), and the **Tag
-and push** step should push the `Release v<version>` commit and tag to `main`
-without a protection error. If the push is rejected, re-check that the App is
+bump). The **Mint GitHub App token** step should run (not skip), and the **Push
+the release commit + tag** step should push the `Release v<version>` commit and
+tag to `main` without a protection error. If the push is rejected, re-check that the App is
 installed on the repo and is actually listed in the ruleset's bypass list, and
 that `RELEASE_APP_ID` / `RELEASE_APP_PRIVATE_KEY` are set on the repo (not the
 org, unless the App is org-owned).

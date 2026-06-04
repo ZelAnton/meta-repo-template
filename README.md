@@ -43,8 +43,9 @@ TODO: show the smallest real usage of __ProjectName__.
 
 ## Verifying the package
 
-> Applies when the project ships a published package. Remove this section for
-> apps or internal libraries.
+> Applies when the GitHub Release attaches downloadable artifacts. Remove this
+> section for apps, internal libraries, or source-only registries (e.g. crates.io)
+> whose releases carry notes but no attached files.
 
 Each GitHub Release ships a `SHA256SUMS` file alongside the published artifacts.
 Download them into the same directory, then:

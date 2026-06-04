@@ -160,6 +160,17 @@ See `BUILD-SYSTEM.TODO.md` for the per-ecosystem file list. Key points:
 - Rename the token-named dirs only if your layout differs — the init scripts rename
   anything containing `__ProjectName__`, so keep that token in folder names you want
   stamped.
+- **Release artifact model.** `release.yml` defaults to the *artifact-producing* shape
+  (.NET/Kotlin): the package step writes downloadable files into `./artifacts`, the
+  `SHA256SUMS` step hashes them, and the GitHub Release attaches them. For a registry
+  that publishes **source directly** (crates.io / Rust) there are no downloadable
+  artifacts — **delete the `Generate SHA256SUMS` step**; the Release step's empty-array
+  guard then attaches release notes only, no other edits needed. The Rust sibling is
+  the worked example.
+- **Optional per-language extras** the meta-template omits (add from the sibling if you
+  want them): Rider settings (`<PROJ>.sln.DotSettings`) and the Linux-container test
+  helper (`scripts/test-linux.ps1` + `docs/linux-testing.md`) for .NET; the Gradle
+  `dependency-submission.yml` workflow for Kotlin.
 
 ## 6. Toggle checklist
 
