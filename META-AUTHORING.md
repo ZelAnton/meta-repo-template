@@ -49,9 +49,13 @@ sibling templates** (`rust-repo-template`, `cSharp-repo-template`,
    the part that is genuinely per-language; do it first so the rest has something to
    build against.
 4. **Replace the stubs**: `src/__ProjectName__/Greeter.%%FileExt%%` and the test
-   stub with a trivial real API + test that builds and passes.
-5. **Fill every `%%token%%`** (section 3), the `TODO(meta:)` steps in
-   `ci.yml` / `release.yml`, and strip every meta-marker — the `META(%%):` banners,
+   stub with a trivial real API + test that builds and passes. **Author the
+   environment preflight** `scripts/check-env.{ps1,sh}` at the same time — fill the
+   required-tool check(s), any pinned-version floor, and the per-OS install commands
+   (the skeleton is neutral; the sibling's filled version is the worked example).
+5. **Fill every `%%token%%`** (section 3), the `TODO(meta:)` placeholders in
+   `ci.yml` / `release.yml` / `scripts/check-env.{ps1,sh}`, and strip every
+   meta-marker — the `META(%%):` banners,
    the `<!-- META: keep/author … -->` tags in `AGENTS.md`, and the
    `<!-- META:start … META:end -->` block in `README.md`.
    `grep -rnE '%%|META:|TODO\(meta' .` finds them all.
@@ -101,6 +105,11 @@ Caveats:
   That is correct for `cargo`/`dotnet`, but Gradle drives the build through the
   **wrapper** — replace it with `Bash(./gradlew *)` (and add `Bash(./gradlew.bat *)`
   if Windows clones need it). List whatever build commands the project actually runs.
+- **`scripts/check-env.{ps1,sh}`** ship a baseline check that `%%BuildTool%%` is on
+  PATH. That is right for `cargo`/`dotnet`, but Gradle runs through the **wrapper**
+  (`./gradlew`), not a PATH `gradle` — for Kotlin replace the baseline with a
+  launcher-JDK check (`java` ≥ 17), as the Kotlin sibling does. Add any pinned-version
+  floor (e.g. the .NET SDK major from `global.json`) and fill the per-OS install lines.
 - **Registries needing more than one secret** (e.g. Maven Central:
   `MAVEN_CENTRAL_USERNAME` + `MAVEN_CENTRAL_PASSWORD` + `SIGNING_KEY` +
   `SIGNING_PASSWORD`) — `%%PublishSecret%%` only stamps the single name used by the
@@ -139,6 +148,8 @@ Caveats:
 | `CLAUDE.md` | S | command quick-ref + Architecture pointer |
 | `TEMPLATE.md` | S | generated template's end-user guide |
 | `docs/AGENT-INIT-GUIDE.md` | S | keep structure + failure-log; fill stack facts |
+| `scripts/check-env.ps1` | S | toolchain-presence preflight; fill tool/version checks + per-OS install commands |
+| `scripts/check-env.sh` | S | POSIX counterpart of check-env.ps1 |
 | `scripts/init.ps1` | S | fill next-steps; adapt XML/extra-token blocks |
 | `scripts/init.sh` | S | POSIX counterpart of init.ps1 |
 | `src/__ProjectName__/Greeter.%%FileExt%%` | STUB | real sample API; rename `%%FileExt%%` |

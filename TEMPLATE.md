@@ -15,7 +15,23 @@ conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
 
 1. Create a new repository from this one (GitHub: **Use this template**), or copy
    the files into a fresh repo.
-2. Run the init script once to stamp your project name in. Use whichever matches
+2. **Check your environment is ready.** Before initializing, confirm this machine
+   has the toolchain to build and test a %%LangName%% project. Use whichever matches
+   your shell — both do the same thing:
+
+   ```pwsh
+   pwsh ./scripts/check-env.ps1
+   ```
+
+   ```bash
+   bash ./scripts/check-env.sh
+   ```
+
+   It checks the %%LangName%% toolchain (%%BuildTool%%) is on PATH. If anything
+   required is missing it lists the install commands for your OS and exits non-zero —
+   install what it names, then re-run it. **Don't run init until it reports the
+   environment is ready.**
+3. Run the init script once to stamp your project name in. Use whichever matches
    your shell — both do the same thing:
 
    ```pwsh
@@ -30,17 +46,18 @@ conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
    defaults. The script replaces the placeholder tokens in file contents, renames
    the token-named files and folders, activates `.claude/settings.json` from its
    `.template` form, deletes this `TEMPLATE.md` and `docs/AGENT-INIT-GUIDE.md`, and
-   (unless `-KeepScript` / `--keep-script`) removes **both** initializers.
-3. Verify:
+   (unless `-KeepScript` / `--keep-script`) removes **both** initializers
+   (`check-env.{ps1,sh}` stay — they double as a contributor onboarding check).
+4. Verify:
 
    ```sh
    %%BuildCmd%%
    %%TestCmd%%
    ```
 
-4. Replace the placeholder `Greeter` type in `%%SrcLayout%%` with your real API and
+5. Replace the placeholder `Greeter` type in `%%SrcLayout%%` with your real API and
    delete the sample test.
-5. **Keep the agent-instruction files local.** This template tracks and ships
+6. **Keep the agent-instruction files local.** This template tracks and ships
    `CLAUDE.md`, `AGENTS.md`, and `.claude/` on purpose — but a repo *created from*
    it should keep them out of its remote. The init script does **not** do this — it
    is a by-hand step. Before your first push, git-ignore and untrack them:

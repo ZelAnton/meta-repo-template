@@ -119,6 +119,7 @@ jobs:
               patch) NEW="${MAJOR}.${MINOR}.$((PATCH+1))" ;;
             esac
             echo "Latest release tag: $LATEST_TAG (current=$CURRENT); ${{ inputs.bump }} bump -> $NEW"
+            echo "first_release=false" >> "$GITHUB_OUTPUT"
           else
             # First release: seed the version straight from the build manifest so the
             # published version matches what the repo declares. The bump input is ignored.
@@ -129,6 +130,7 @@ jobs:
             CURRENT="0.0.0"
             NEW=$(%%VersionSeedCmd%%)
             echo "No release tags found; seeding first release from manifest version=$NEW (bump input ignored)."
+            echo "first_release=true" >> "$GITHUB_OUTPUT"
           fi
           if [[ ! "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Computed version '$NEW' is not a valid MAJOR.MINOR.PATCH semver."
@@ -308,6 +310,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           TAG: ${{ steps.version.outputs.tag }}
           PREV_TAG: v${{ steps.version.outputs.current }}
+          FIRST_RELEASE: ${{ steps.version.outputs.first_release }}
         run: |
           set -euo pipefail
           python3 <<'PY'
@@ -320,6 +323,7 @@ jobs:
           version = os.environ["VERSION"]
           tag = os.environ["TAG"]
           prev_tag = os.environ["PREV_TAG"]
+          first_release = os.environ.get("FIRST_RELEASE") == "true"
           date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
           repo = "https://github.com/__GitHubOwner__/__ProjectName__"
 
@@ -338,9 +342,16 @@ jobs:
               print("::error::Could not find '## [Unreleased]' header in CHANGELOG.md", file=sys.stderr)
               sys.exit(1)
 
+          # On the first release the previous tag (v0.0.0) is synthetic — created
+          # locally to bound git-cliff and never pushed — so a compare link against
+          # it would 404. Point the first version at its own tag instead.
+          if first_release:
+              versioned_link = f"[{version}]: {repo}/releases/tag/{tag}"
+          else:
+              versioned_link = f"[{version}]: {repo}/compare/{prev_tag}...{tag}"
           link_replacement = (
               f"[Unreleased]: {repo}/compare/{tag}...HEAD\n"
-              f"[{version}]: {repo}/compare/{prev_tag}...{tag}"
+              + versioned_link
           )
           text, n = re.subn(r"^\[Unreleased\]:.*$", link_replacement, text, count=1, flags=re.M)
           if n != 1:
