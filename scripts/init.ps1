@@ -89,6 +89,9 @@ if ($GitHubOwner -notmatch '\A[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\z') 
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $selfPath = $PSCommandPath
+$claudeSettings = Join-Path $repoRoot '.claude/settings.json'
+$claudeTemplate = Join-Path $repoRoot '.claude/settings.json.template'
+$hasExistingClaudeSettings = Test-Path -LiteralPath $claudeSettings
 
 # META(%%): add any extra project tokens your language needs (e.g. JVM:
 #   '__PackageName__' = $PackageName; '__Group__' = $Group) plus matching params above.
@@ -131,9 +134,13 @@ Write-Host "==> Initializing template as '$ProjectName'" -ForegroundColor Cyan
 
 # 1) Replace tokens in file contents. Both initializers are skipped: they carry the
 #    placeholder search-keys as literals, so substituting them would corrupt them.
+#    An existing user settings file is opaque and must survive byte-for-byte.
 $siblingShPath = Join-Path $PSScriptRoot 'init.sh'
 $files = Get-ChildItem -Path $repoRoot -File -Recurse -Force | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and $_.FullName -ne $siblingShPath
+    -not (Test-Excluded $_.FullName) -and
+    $_.FullName -ne $selfPath -and
+    $_.FullName -ne $siblingShPath -and
+    $_.FullName -ne $claudeSettings
 }
 $contentChanged = 0
 foreach ($file in $files) {
@@ -165,10 +172,27 @@ foreach ($item in $named) {
 #   move src/main/kotlin/__PackageName__ to the real dotted package directory tree.
 
 # 3) Activate the Claude Code shared settings (shipped inert as a .template file).
-$claudeTemplate = Join-Path $repoRoot '.claude/settings.json.template'
-if (Test-Path $claudeTemplate) {
-    Move-Item -LiteralPath $claudeTemplate -Destination (Join-Path $repoRoot '.claude/settings.json') -Force
-    Write-Host "    Activated .claude/settings.json" -ForegroundColor DarkGray
+if ($hasExistingClaudeSettings) {
+    if (Test-Path -LiteralPath $claudeTemplate) {
+        Write-Host '    Kept existing .claude/settings.json unchanged; left .claude/settings.json.template in place.' -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host '    Kept existing .claude/settings.json unchanged; no settings template needed activation.' -ForegroundColor DarkGray
+    }
+}
+elseif (Test-Path -LiteralPath $claudeTemplate) {
+    try {
+        Move-Item -LiteralPath $claudeTemplate -Destination $claudeSettings -ErrorAction Stop
+        Write-Host '    Activated .claude/settings.json' -ForegroundColor DarkGray
+    }
+    catch {
+        if (Test-Path -LiteralPath $claudeSettings) {
+            Write-Host '    Kept existing .claude/settings.json unchanged; left .claude/settings.json.template in place.' -ForegroundColor DarkGray
+        }
+        else {
+            throw
+        }
+    }
 }
 
 # 4) Remove template-only files.

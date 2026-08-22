@@ -26,6 +26,9 @@ This log belongs to `meta-repo-template` itself. Keep these entries out of
 - 2026-08-22: Template initialization now rejects multiline release identities and
   invalid GitHub owners while preserving shell metacharacters without
   release-workflow injection.
+- 2026-08-22: Both initializers now preserve an existing
+  `.claude/settings.json` byte-for-byte, retain the `.template` file for manual
+  comparison, and remain idempotent when run again.
 
 ## 1. What this is, and the two-token model
 
@@ -124,6 +127,8 @@ Caveats:
   That is correct for `cargo`/`dotnet`, but Gradle drives the build through the
   **wrapper** — replace it with `Bash(./gradlew *)` (and add `Bash(./gradlew.bat *)`
   if Windows clones need it). List whatever build commands the project actually runs.
+  Initialization activates this file only when `.claude/settings.json` is absent;
+  otherwise it preserves the existing settings and retains the template for comparison.
 - **`scripts/check-env.{ps1,sh}`** ship a baseline check that `%%BuildTool%%` is on
   PATH. That is right for `cargo`/`dotnet`, but Gradle runs through the **wrapper**
   (`./gradlew`), not a PATH `gradle` — for Kotlin replace the baseline with a
@@ -240,8 +245,9 @@ See `BUILD-SYSTEM.TODO.md` for the per-ecosystem file list. Key points:
 
 1. **Initializer metadata safety and parity:** run
    `pwsh ./tests/init-metadata.tests.ps1`. It exercises both initializers in
-   isolated copies, validates their generated Bash/Python/CODEOWNERS contexts, and
-   verifies rejected metadata leaves the template unchanged.
+   isolated copies, validates their generated Bash/Python/CODEOWNERS contexts, verifies
+   rejected metadata leaves the template unchanged, and checks settings activation,
+   destination conflicts, exact byte preservation, and repeated runs.
 2. **No stray meta-tokens, markers, or TODOs:** `grep -rnE '%%|META:|TODO\(meta' .`
    over the finished template returns nothing (ignore `.git`/`.jj`). This single
    pattern catches the `%%Token%%` slots, the `META(%%):` banners, the
