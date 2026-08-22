@@ -105,12 +105,17 @@ jobs:
         id: version
         run: |
           set -euo pipefail
-          # Newest version-sorted release tag. Use for-each-ref (--count=1) rather than
-          # `git tag --list ... | head -n1`: head closes the pipe after one line, which
-          # can SIGPIPE-abort `git tag` under `set -o pipefail` once the tag list exceeds
-          # the pipe buffer (~thousands of tags).
-          LATEST_TAG=$(git for-each-ref --count=1 --sort=-v:refname \
-            --format='%(refname:short)' 'refs/tags/v[0-9]*.[0-9]*.[0-9]*')
+          # Enumerate all tags in version-aware order, then accept only a complete stable
+          # semver name. Capturing the list first preserves git failures under `set -e`
+          # without an early-closing pipeline that can SIGPIPE the producer.
+          TAG_REFS=$(git for-each-ref --sort=-v:refname \
+            --format='%(refname:lstrip=2)' refs/tags/)
+          LATEST_TAG=""
+          while IFS= read -r TAG; do
+            if [[ -z "$LATEST_TAG" && "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              LATEST_TAG="$TAG"
+            fi
+          done <<< "$TAG_REFS"
           if [[ -n "$LATEST_TAG" ]]; then
             CURRENT="${LATEST_TAG#v}"
             if [[ ! "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
