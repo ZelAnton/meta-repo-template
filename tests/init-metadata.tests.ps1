@@ -471,7 +471,7 @@ function Test-SettingsActivationAndRepeat([ValidateSet('pwsh', 'bash')][string]$
 }
 
 function Test-ExcludedStatePreserved([ValidateSet('pwsh', 'bash')][string]$kind) {
-    $root = Join-Path $tempRoot "excluded-state-$kind"
+    $root = Join-Path $tempRoot ".work/outer/.inbox/excluded-state-$kind"
     Copy-Template $root
 
     $fixtures = @(

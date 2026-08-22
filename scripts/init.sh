@@ -180,7 +180,8 @@ echo "    Updated contents in $changed file(s)."
 # 2) Rename files and folders whose name contains the project-name token. -depth
 #    processes children before parents (deepest paths first).
 while IFS= read -r -d '' item; do
-  case "$item" in
+  relative_item="${item#"$repo_root"/}"
+  case "/$relative_item/" in
     */.git/*|*/.jj/*|*/.work/*|*/.inbox/*|*/bin/*|*/obj/*) continue ;;
   esac
   dir="$(dirname "$item")"
