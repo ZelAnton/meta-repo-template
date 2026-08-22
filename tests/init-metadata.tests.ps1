@@ -268,7 +268,7 @@ function Test-GeneratedSyntaxAndExecution(
     }
 }
 
-function Get-ReleaseVersionScript {
+function Get-ReleaseVersionScript([string]$seedVersion = '1.2.3') {
     $workflowLines = [IO.File]::ReadAllLines((Join-Path $sourceRoot '.github/workflows/release.yml'))
     $stepStart = [Array]::IndexOf($workflowLines, '      - name: Determine next version')
     $runStart = if ($stepStart -ge 0) {
@@ -288,7 +288,7 @@ function Get-ReleaseVersionScript {
     $script = @($workflowLines[($runStart + 1)..($stepEnd - 1)] | ForEach-Object {
         if ($_.StartsWith('          ')) { $_.Substring(10) } else { $_ }
     }) -join "`n"
-    return $script.Replace('${{ inputs.bump }}', 'patch').Replace('NEW=$(%%VersionSeedCmd%%)', 'NEW="1.2.3"')
+    return $script.Replace('${{ inputs.bump }}', 'patch').Replace('NEW=$(%%VersionSeedCmd%%)', "NEW=`"$seedVersion`"")
 }
 
 function Test-ReleaseVersionSelection {
@@ -314,6 +314,20 @@ function Test-ReleaseVersionSelection {
             Current = '1.9.0'
             Version = '1.9.1'
             FirstRelease = 'false'
+        },
+        @{
+            Name = 'stable-and-leading-zero-tags'
+            Tags = @('v1.9.0', 'v2.08.0', 'v3.0.00', 'v04.0.0')
+            Current = '1.9.0'
+            Version = '1.9.1'
+            FirstRelease = 'false'
+        },
+        @{
+            Name = 'only-leading-zero-tags'
+            Tags = @('v01.0.0', 'v2.00.0', 'v3.0.00')
+            Current = '0.0.0'
+            Version = '1.2.3'
+            FirstRelease = 'true'
         }
     )
 
@@ -343,6 +357,23 @@ function Test-ReleaseVersionSelection {
         Assert-Equal $case.Version $outputs.version "Release version case '$($case.Name)' computed the wrong next version.`n$($result.Output)"
         Assert-Equal $case.FirstRelease $outputs.first_release "Release version case '$($case.Name)' reported the wrong first-release state.`n$($result.Output)"
     }
+}
+
+function Test-ReleaseVersionRejectsNoncanonicalSeed {
+    $root = Join-Path $tempRoot 'release-version-noncanonical-seed'
+    [IO.Directory]::CreateDirectory($root) | Out-Null
+    $null = Invoke-Captured 'git' @('init', '-q') $root
+    $null = Invoke-Captured 'git' @('config', 'user.name', 'Release Test') $root
+    $null = Invoke-Captured 'git' @('config', 'user.email', 'release-test@example.invalid') $root
+    $null = Invoke-Captured 'git' @('commit', '--allow-empty', '-qm', 'fixture') $root
+
+    $runnerPath = Join-Path $root '.release-version.sh'
+    $runner = 'export GITHUB_OUTPUT="$PWD/.github-output"' + "`n$(Get-ReleaseVersionScript '01.2.3')`n"
+    [IO.File]::WriteAllText($runnerPath, $runner.Replace("`r`n", "`n"), $utf8NoBom)
+    $null = Invoke-Captured 'bash' @('-n', './.release-version.sh') $root
+    $result = Invoke-Captured 'bash' @('./.release-version.sh') $root -ExpectFailure
+
+    Assert-True $result.Output.Contains("Computed version '01.2.3' is not a valid MAJOR.MINOR.PATCH semver.") 'Release version validation accepted a manifest seed with a leading zero.'
 }
 
 function Test-ReleaseOrderingInvariant {
@@ -420,6 +451,7 @@ try {
     }
 
     Test-ReleaseVersionSelection
+    Test-ReleaseVersionRejectsNoncanonicalSeed
     Test-ReleaseOrderingInvariant
 
     $ownerCases = @(
