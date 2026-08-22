@@ -268,6 +268,132 @@ function Test-GeneratedSyntaxAndExecution(
     }
 }
 
+function Get-ReleaseVersionScript([string]$seedVersion = '1.2.3') {
+    $workflowLines = [IO.File]::ReadAllLines((Join-Path $sourceRoot '.github/workflows/release.yml'))
+    $stepStart = [Array]::IndexOf($workflowLines, '      - name: Determine next version')
+    $runStart = if ($stepStart -ge 0) {
+        [Array]::IndexOf($workflowLines, '        run: |', $stepStart)
+    }
+    else {
+        -1
+    }
+    $stepEnd = if ($runStart -ge 0) {
+        [Array]::IndexOf($workflowLines, '      - name: Verify tag does not exist', $runStart)
+    }
+    else {
+        -1
+    }
+    Assert-True ($runStart -ge 0 -and $stepEnd -gt $runStart) 'Could not extract the release version shell block.'
+
+    $script = @($workflowLines[($runStart + 1)..($stepEnd - 1)] | ForEach-Object {
+        if ($_.StartsWith('          ')) { $_.Substring(10) } else { $_ }
+    }) -join "`n"
+    return $script.Replace('${{ inputs.bump }}', 'patch').Replace('NEW=$(%%VersionSeedCmd%%)', "NEW=`"$seedVersion`"")
+}
+
+function Test-ReleaseVersionSelection {
+    $versionScript = Get-ReleaseVersionScript
+    $cases = @(
+        @{
+            Name = 'no-tags'
+            Tags = @()
+            Current = '0.0.0'
+            Version = '1.2.3'
+            FirstRelease = 'true'
+        },
+        @{
+            Name = 'stable-tags'
+            Tags = @('v1.2.9', 'v1.10.0')
+            Current = '1.10.0'
+            Version = '1.10.1'
+            FirstRelease = 'false'
+        },
+        @{
+            Name = 'stable-and-prerelease-tags'
+            Tags = @('v1.9.0', 'v2.0.0-rc.1', 'v2.0.0+build.1', 'release-99.0.0')
+            Current = '1.9.0'
+            Version = '1.9.1'
+            FirstRelease = 'false'
+        },
+        @{
+            Name = 'stable-and-leading-zero-tags'
+            Tags = @('v1.9.0', 'v2.08.0', 'v3.0.00', 'v04.0.0')
+            Current = '1.9.0'
+            Version = '1.9.1'
+            FirstRelease = 'false'
+        },
+        @{
+            Name = 'only-leading-zero-tags'
+            Tags = @('v01.0.0', 'v2.00.0', 'v3.0.00')
+            Current = '0.0.0'
+            Version = '1.2.3'
+            FirstRelease = 'true'
+        }
+    )
+
+    foreach ($case in $cases) {
+        $root = Join-Path $tempRoot "release-version-$($case.Name)"
+        [IO.Directory]::CreateDirectory($root) | Out-Null
+        $null = Invoke-Captured 'git' @('init', '-q') $root
+        $null = Invoke-Captured 'git' @('config', 'user.name', 'Release Test') $root
+        $null = Invoke-Captured 'git' @('config', 'user.email', 'release-test@example.invalid') $root
+        $null = Invoke-Captured 'git' @('commit', '--allow-empty', '-qm', 'fixture') $root
+        foreach ($tag in $case.Tags) {
+            $null = Invoke-Captured 'git' @('tag', $tag) $root
+        }
+
+        $runnerPath = Join-Path $root '.release-version.sh'
+        $runner = 'export GITHUB_OUTPUT="$PWD/.github-output"' + "`n$versionScript`n"
+        [IO.File]::WriteAllText($runnerPath, $runner.Replace("`r`n", "`n"), $utf8NoBom)
+        $null = Invoke-Captured 'bash' @('-n', './.release-version.sh') $root
+        $result = Invoke-Captured 'bash' @('./.release-version.sh') $root
+
+        $outputs = @{}
+        foreach ($line in [IO.File]::ReadAllLines((Join-Path $root '.github-output'))) {
+            $pair = $line -split '=', 2
+            if ($pair.Count -eq 2) { $outputs[$pair[0]] = $pair[1] }
+        }
+        Assert-Equal $case.Current $outputs.current "Release version case '$($case.Name)' selected the wrong base version.`n$($result.Output)"
+        Assert-Equal $case.Version $outputs.version "Release version case '$($case.Name)' computed the wrong next version.`n$($result.Output)"
+        Assert-Equal $case.FirstRelease $outputs.first_release "Release version case '$($case.Name)' reported the wrong first-release state.`n$($result.Output)"
+    }
+}
+
+function Test-ReleaseVersionRejectsNoncanonicalSeed {
+    $root = Join-Path $tempRoot 'release-version-noncanonical-seed'
+    [IO.Directory]::CreateDirectory($root) | Out-Null
+    $null = Invoke-Captured 'git' @('init', '-q') $root
+    $null = Invoke-Captured 'git' @('config', 'user.name', 'Release Test') $root
+    $null = Invoke-Captured 'git' @('config', 'user.email', 'release-test@example.invalid') $root
+    $null = Invoke-Captured 'git' @('commit', '--allow-empty', '-qm', 'fixture') $root
+
+    $runnerPath = Join-Path $root '.release-version.sh'
+    $runner = 'export GITHUB_OUTPUT="$PWD/.github-output"' + "`n$(Get-ReleaseVersionScript '01.2.3')`n"
+    [IO.File]::WriteAllText($runnerPath, $runner.Replace("`r`n", "`n"), $utf8NoBom)
+    $null = Invoke-Captured 'bash' @('-n', './.release-version.sh') $root
+    $result = Invoke-Captured 'bash' @('./.release-version.sh') $root -ExpectFailure
+
+    Assert-True $result.Output.Contains("Computed version '01.2.3' is not a valid MAJOR.MINOR.PATCH semver.") 'Release version validation accepted a manifest seed with a leading zero.'
+}
+
+function Test-ReleaseOrderingInvariant {
+    $workflow = [IO.File]::ReadAllText((Join-Path $sourceRoot '.github/workflows/release.yml'))
+    $orderedSteps = @(
+        '- name: Determine next version',
+        '- name: Build, test, and package',
+        '- name: Commit and tag the release (local only)',
+        '- name: Publish to %%RegistryName%% (irreversible pivot)',
+        '- name: Push the release commit + tag (atomic)',
+        '- name: Create or update the GitHub Release (idempotent)'
+    )
+    $previous = -1
+    foreach ($step in $orderedSteps) {
+        $current = $workflow.IndexOf($step, [StringComparison]::Ordinal)
+        Assert-True ($current -gt $previous) "Release ordering invariant is broken at step '$step'."
+        $previous = $current
+    }
+}
+
 function Test-RejectedInput(
     [ValidateSet('pwsh', 'bash')][string]$kind,
     [string]$caseName,
@@ -324,6 +450,10 @@ try {
         Assert-Equal $powerShellOutput $bashOutput "Initializer parity failed for $relativePath."
     }
 
+    Test-ReleaseVersionSelection
+    Test-ReleaseVersionRejectsNoncanonicalSeed
+    Test-ReleaseOrderingInvariant
+
     $ownerCases = @(
         @{ Name = 'quote'; Value = 'bad"owner' },
         @{ Name = 'backtick'; Value = 'bad`owner' },
@@ -345,7 +475,7 @@ try {
         Test-OwnerBoundary $kind ("a$('-' * 37)z") 'maximum'
     }
 
-    Write-Host 'PASS: metadata initialization is equivalent, syntax-valid, failure-safe, and injection-safe.' -ForegroundColor Green
+    Write-Host 'PASS: metadata initialization and release version selection are equivalent, syntax-valid, failure-safe, and injection-safe.' -ForegroundColor Green
 }
 finally {
     if (Test-Path -LiteralPath $tempRoot) {

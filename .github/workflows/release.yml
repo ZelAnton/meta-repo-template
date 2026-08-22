@@ -105,15 +105,22 @@ jobs:
         id: version
         run: |
           set -euo pipefail
-          # Newest version-sorted release tag. Use for-each-ref (--count=1) rather than
-          # `git tag --list ... | head -n1`: head closes the pipe after one line, which
-          # can SIGPIPE-abort `git tag` under `set -o pipefail` once the tag list exceeds
-          # the pipe buffer (~thousands of tags).
-          LATEST_TAG=$(git for-each-ref --count=1 --sort=-v:refname \
-            --format='%(refname:short)' 'refs/tags/v[0-9]*.[0-9]*.[0-9]*')
+          # Enumerate all tags in version-aware order, then accept only a complete stable
+          # semver name. Capturing the list first preserves git failures under `set -e`
+          # without an early-closing pipeline that can SIGPIPE the producer.
+          TAG_REFS=$(git for-each-ref --sort=-v:refname \
+            --format='%(refname:lstrip=2)' refs/tags/)
+          STABLE_TAG_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          CORE_VERSION_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          LATEST_TAG=""
+          while IFS= read -r TAG; do
+            if [[ -z "$LATEST_TAG" && "$TAG" =~ $STABLE_TAG_RE ]]; then
+              LATEST_TAG="$TAG"
+            fi
+          done <<< "$TAG_REFS"
           if [[ -n "$LATEST_TAG" ]]; then
             CURRENT="${LATEST_TAG#v}"
-            if [[ ! "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            if [[ ! "$CURRENT" =~ $CORE_VERSION_RE ]]; then
               echo "::error::Could not parse current version from tag (got: '$CURRENT')"
               exit 1
             fi
@@ -137,7 +144,7 @@ jobs:
             echo "No release tags found; seeding first release from manifest version=$NEW (bump input ignored)."
             echo "first_release=true" >> "$GITHUB_OUTPUT"
           fi
-          if [[ ! "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if [[ ! "$NEW" =~ $CORE_VERSION_RE ]]; then
             echo "::error::Computed version '$NEW' is not a valid MAJOR.MINOR.PATCH semver."
             exit 1
           fi
