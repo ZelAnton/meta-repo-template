@@ -369,10 +369,15 @@ jobs:
       # Create the release commit and tag LOCALLY, but do NOT push yet: the push is a
       # VCS write and must happen AFTER the irreversible publish (the pivot below).
       - name: Commit and tag the release (local only)
+        env:
+          RELEASE_AUTHOR_B64: '__AuthorBase64__'
+          RELEASE_AUTHOR_EMAIL_B64: '__AuthorEmailBase64__'
         run: |
           set -euo pipefail
-          git config user.name "__Author__"
-          git config user.email "__AuthorEmail__"
+          release_author="$(printf '%s' "$RELEASE_AUTHOR_B64" | base64 --decode)"
+          release_author_email="$(printf '%s' "$RELEASE_AUTHOR_EMAIL_B64" | base64 --decode)"
+          git config user.name "$release_author"
+          git config user.email "$release_author_email"
           # META(%%): add the manifest file(s) you bumped above alongside CHANGELOG.md.
           git add %%ManifestPath%% CHANGELOG.md
           git commit -m "Release ${{ steps.version.outputs.tag }}"

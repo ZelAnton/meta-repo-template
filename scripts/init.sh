@@ -7,14 +7,19 @@
 # See META-AUTHORING.md.
 #
 # Replaces the placeholder tokens in file contents AND in file/folder names, then
-# removes the template-only files (TEMPLATE.md, docs/AGENT-INIT-GUIDE.md) and —
-# unless --keep-script — both initializers (init.sh and init.ps1).
+# removes the template-only files (TEMPLATE.md, docs/AGENT-INIT-GUIDE.md,
+# tests/init-metadata.tests.ps1) and — unless --keep-script — both initializers
+# (init.sh and init.ps1).
 #
 # Usage:
 #   bash ./scripts/init.sh --project-name Acme.Widgets \
 #       [--author "Jane Doe"] [--author-email you@example.com] \
 #       [--github-owner acme] [--description "Widget toolkit"] \
 #       [--year 2026] [--keep-script]
+#
+# Author and author-email values must be single-line; release-workflow use is
+# serialized so shell metacharacters remain literal. GitHub owner values must be
+# 1-39 letters, digits, or internal hyphens.
 
 set -euo pipefail
 
@@ -76,6 +81,16 @@ fi
 [ -n "$description" ]  || description="TODO: project description"
 [ -n "$year" ]         || year="$(date +%Y)"
 
+case "$author" in
+  *$'\r'*|*$'\n'*) die "invalid --author: line breaks are not allowed. No files were changed." ;;
+esac
+case "$author_email" in
+  *$'\r'*|*$'\n'*) die "invalid --author-email: line breaks are not allowed. No files were changed." ;;
+esac
+if [[ ! "$github_owner" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]]; then
+  die "invalid --github-owner. Use 1-39 letters, digits, or hyphens, with no leading or trailing hyphen. No files were changed."
+fi
+
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 self="$script_dir/$(basename "$0")"
@@ -91,6 +106,37 @@ author_email_x="$(xml_escape "$author_email")"
 owner_x="$(xml_escape "$github_owner")"
 desc_x="$(xml_escape "$description")"
 year_x="$(xml_escape "$year")"
+author_b64="$(printf '%s' "$author" | base64 | tr -d '\r\n')"
+author_email_b64="$(printf '%s' "$author_email" | base64 | tr -d '\r\n')"
+
+token_pattern='(__ProjectName__|__AuthorEmailBase64__|__AuthorBase64__|__AuthorEmail__|__Author__|__GitHubOwner__|__Description__|__Year__)'
+
+replace_tokens() {
+  local content="$1"
+  local mode="$2"
+  local rest="$content"
+  local output=""
+  local token prefix replacement
+
+  while [[ "$rest" =~ $token_pattern ]]; do
+    token="${BASH_REMATCH[1]}"
+    prefix="${rest%%"$token"*}"
+    output+="$prefix"
+    case "$token" in
+      __ProjectName__)       if [ "$mode" = xml ]; then replacement="$project_x"; else replacement="$project_name"; fi ;;
+      __Author__)            if [ "$mode" = xml ]; then replacement="$author_x"; else replacement="$author"; fi ;;
+      __AuthorEmail__)       if [ "$mode" = xml ]; then replacement="$author_email_x"; else replacement="$author_email"; fi ;;
+      __AuthorBase64__)      replacement="$author_b64" ;;
+      __AuthorEmailBase64__) replacement="$author_email_b64" ;;
+      __GitHubOwner__)       if [ "$mode" = xml ]; then replacement="$owner_x"; else replacement="$github_owner"; fi ;;
+      __Description__)       if [ "$mode" = xml ]; then replacement="$desc_x"; else replacement="$description"; fi ;;
+      __Year__)              if [ "$mode" = xml ]; then replacement="$year_x"; else replacement="$year"; fi ;;
+    esac
+    output+="$replacement"
+    rest="${rest#*"$token"}"
+  done
+  printf '%s%s' "$output" "$rest"
+}
 
 echo "==> Initializing template as '$project_name'"
 
@@ -106,21 +152,14 @@ while IFS= read -r -d '' file; do
   case "$file" in
     *.snk|*.pfx|*.png|*.jpg|*.jpeg|*.gif|*.ico|*.zip|*.jar) continue ;;
   esac
-  case "$file" in
-    *.csproj|*.fsproj|*.props|*.targets|*.slnx|*.config)
-      p=$project_x; a=$author_x; ae=$author_email_x; o=$owner_x; d=$desc_x; y=$year_x ;;
-    *)
-      p=$project_name; a=$author; ae=$author_email; o=$github_owner; d=$description; y=$year ;;
-  esac
   # Preserve trailing newlines: append a sentinel before capture, strip it after.
   content="$(cat "$file"; printf x)"; content="${content%x}"
   orig="$content"
-  content="${content//__ProjectName__/$p}"
-  content="${content//__Author__/$a}"
-  content="${content//__AuthorEmail__/$ae}"
-  content="${content//__GitHubOwner__/$o}"
-  content="${content//__Description__/$d}"
-  content="${content//__Year__/$y}"
+  case "$file" in
+    *.csproj|*.fsproj|*.props|*.targets|*.slnx|*.config) mode=xml ;;
+    *) mode=raw ;;
+  esac
+  content="$(replace_tokens "$content" "$mode"; printf x)"; content="${content%x}"
   if [ "$content" != "$orig" ]; then
     printf '%s' "$content" > "$file"
     changed=$((changed + 1))
@@ -152,7 +191,8 @@ if [ -f "$repo_root/.claude/settings.json.template" ]; then
 fi
 
 # 4) Remove template-only files.
-rm -f "$repo_root/TEMPLATE.md" "$repo_root/docs/AGENT-INIT-GUIDE.md"
+rm -f "$repo_root/TEMPLATE.md" "$repo_root/docs/AGENT-INIT-GUIDE.md" \
+  "$repo_root/tests/init-metadata.tests.ps1"
 rmdir "$repo_root/docs" 2>/dev/null || true
 
 echo ""

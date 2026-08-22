@@ -43,10 +43,14 @@ conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
    ```
 
    `-ProjectName` / `--project-name` is required; the rest fall back to sensible
-   defaults. The script replaces the placeholder tokens in file contents, renames
-   the token-named files and folders, activates `.claude/settings.json` from its
-   `.template` form, deletes this `TEMPLATE.md` and `docs/AGENT-INIT-GUIDE.md`, and
-   (unless `-KeepScript` / `--keep-script`) removes **both** initializers
+   defaults. Author and author-email values must be single-line; quotes, backticks,
+   dollar substitutions, and backslashes are serialized safely in the release
+   workflow. GitHub owners must be 1-39 letters, digits, or internal hyphens. The
+   script replaces the placeholder tokens in file contents, renames the token-named
+   files and folders, activates `.claude/settings.json` from its `.template` form,
+   deletes this `TEMPLATE.md`, `docs/AGENT-INIT-GUIDE.md`, and the template-only
+   `tests/init-metadata.tests.ps1`, and (unless `-KeepScript` / `--keep-script`)
+   removes **both** initializers
    (`check-env.{ps1,sh}` stay — they double as a contributor onboarding check).
 4. Verify:
 
@@ -78,9 +82,9 @@ conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
 | Token | Meaning |
 |---|---|
 | `__ProjectName__` | project / namespace / package id + file & folder names |
-| `__Author__` | author (LICENSE, package metadata) |
-| `__AuthorEmail__` | author email (release-commit identity in `release.yml`) |
-| `__GitHubOwner__` | GitHub owner/org in repository URLs |
+| `__Author__` | single-line author (LICENSE, package metadata, release identity) |
+| `__AuthorEmail__` | single-line author email (release-commit identity in `release.yml`) |
+| `__GitHubOwner__` | 1-39 character GitHub owner/org path segment in repository URLs and `CODEOWNERS` |
 | `__Description__` | package description |
 | `__Year__` | copyright year |
 <!-- META(%%): add any extra project tokens your language needs, e.g. for JVM:
