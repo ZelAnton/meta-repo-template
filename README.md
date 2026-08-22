@@ -16,7 +16,8 @@
 >
 > Before copying the meta-template, run
 > `pwsh ./tests/init-metadata.tests.ps1` to verify PowerShell/Bash initializer
-> parity and generated release-metadata safety.
+> parity, generated release-metadata safety, and idempotent preservation of existing
+> `.claude/settings.json` files.
 >
 > Everything below this block is the README the *generated* template ships.
 <!-- META:end -->

@@ -29,7 +29,8 @@ gone wrong in avoidable ways. **Read it before touching any files.**
    PowerShell cmdlets fail there. Use the PowerShell tool for cmdlets.
 5. **Don't fight the permission model.** `.claude/settings.json` ships as a
    `.template`; activating it is the script's / user's job, not something you force by
-   writing allow-rules yourself.
+   writing allow-rules yourself. If local settings already exist, init preserves their
+   bytes and leaves the template beside them for manual comparison.
 6. **Verify, then clean.** `%%BuildCmd%%` + `%%TestCmd%%`, then remove build artifacts
    before finishing.
 7. **Keep agent files local.** In the *new* repo, git-ignore and untrack the
@@ -71,7 +72,9 @@ Confirm these facts by reading, not by assuming:
 
    `-ProjectName` is required; the rest fall back to sensible defaults. The script
    substitutes tokens, renames files/folders, activates `.claude/settings.json` from
-   its `.template`, and deletes `TEMPLATE.md` (and itself unless `-KeepScript`).
+   its `.template`, and deletes `TEMPLATE.md` (and itself unless `-KeepScript`). When
+   `.claude/settings.json` already exists, init keeps it byte-for-byte and leaves the
+   `.template` file available for manual comparison.
 4. **Verify**: `%%BuildCmd%%` then `%%TestCmd%%`.
 5. Replace the placeholder `Greeter` with the real API, delete the sample test, fill
    in the `CLAUDE.md` "Architecture" section, and work through the `TEMPLATE.md`

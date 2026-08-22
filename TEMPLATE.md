@@ -47,7 +47,9 @@ conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
    dollar substitutions, and backslashes are serialized safely in the release
    workflow. GitHub owners must be 1-39 letters, digits, or internal hyphens. The
    script replaces the placeholder tokens in file contents, renames the token-named
-   files and folders, activates `.claude/settings.json` from its `.template` form,
+   files and folders, and activates `.claude/settings.json` from its `.template` form.
+   If `.claude/settings.json` already exists, the script preserves it byte-for-byte
+   and leaves `.claude/settings.json.template` in place for manual comparison. It then
    deletes this `TEMPLATE.md`, `docs/AGENT-INIT-GUIDE.md`, and the template-only
    `tests/init-metadata.tests.ps1`, and (unless `-KeepScript` / `--keep-script`)
    removes **both** initializers

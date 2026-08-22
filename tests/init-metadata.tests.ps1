@@ -19,6 +19,14 @@ function Assert-Equal([string]$expected, [string]$actual, [string]$message) {
     }
 }
 
+function Assert-BytesEqual([byte[]]$expected, [byte[]]$actual, [string]$message) {
+    $expectedBase64 = [Convert]::ToBase64String($expected)
+    $actualBase64 = [Convert]::ToBase64String($actual)
+    if ($expectedBase64 -cne $actualBase64) {
+        throw "$message`nExpected bytes (base64): $expectedBase64`nActual bytes (base64):   $actualBase64"
+    }
+}
+
 function Copy-Template([string]$destination) {
     [IO.Directory]::CreateDirectory($destination) | Out-Null
     Get-ChildItem -LiteralPath $sourceRoot -Force | Where-Object {
@@ -89,7 +97,7 @@ function Invoke-Initializer(
                     Year = 2042
                     KeepScript = $true
                 }
-                $records = @(& './scripts/init.ps1' @parameters 2>&1)
+                $records = @(& './scripts/init.ps1' @parameters *>&1)
                 $exitCode = 0
             }
             catch {
@@ -427,6 +435,41 @@ function Test-OwnerBoundary(
     Assert-True $codeOwners.Contains("# * @$owner") "$kind did not preserve supported owner boundary $caseName."
 }
 
+function Test-ExistingSettingsPreserved([ValidateSet('pwsh', 'bash')][string]$kind) {
+    $root = Join-Path $tempRoot "settings-existing-$kind"
+    Copy-Template $root
+    $settingsPath = Join-Path $root '.claude/settings.json'
+    $templatePath = Join-Path $root '.claude/settings.json.template'
+    $payload = [byte[]](@(0xEF, 0xBB, 0xBF) + [Text.Encoding]::UTF8.GetBytes(
+        "{`r`n  `"localLiteral`": `"__ProjectName__`",`r`n  `"enabled`": true`r`n}"
+    ))
+    [IO.File]::WriteAllBytes($settingsPath, $payload)
+
+    $result = Invoke-Initializer $kind $root 'Settings Author' 'settings@example.invalid' 'settings-owner'
+
+    Assert-True $result.Output.Contains('Kept existing .claude/settings.json unchanged; left .claude/settings.json.template in place.') "$kind did not report the settings conflict clearly.`n$($result.Output)"
+    Assert-BytesEqual $payload ([IO.File]::ReadAllBytes($settingsPath)) "$kind changed the existing user settings bytes."
+    Assert-True (Test-Path -LiteralPath $templatePath -PathType Leaf) "$kind removed the settings template during a destination conflict."
+}
+
+function Test-SettingsActivationAndRepeat([ValidateSet('pwsh', 'bash')][string]$kind) {
+    $root = Join-Path $tempRoot "settings-repeat-$kind"
+    Copy-Template $root
+    $settingsPath = Join-Path $root '.claude/settings.json'
+    $templatePath = Join-Path $root '.claude/settings.json.template'
+
+    $first = Invoke-Initializer $kind $root 'Settings Author' 'settings@example.invalid' 'settings-owner'
+    Assert-True $first.Output.Contains('Activated .claude/settings.json') "$kind did not report settings activation.`n$($first.Output)"
+    Assert-True (Test-Path -LiteralPath $settingsPath -PathType Leaf) "$kind did not activate the settings template."
+    Assert-True (-not (Test-Path -LiteralPath $templatePath)) "$kind retained the template after successful activation."
+    $activatedBytes = [IO.File]::ReadAllBytes($settingsPath)
+
+    $second = Invoke-Initializer $kind $root 'Settings Author' 'settings@example.invalid' 'settings-owner'
+    Assert-True $second.Output.Contains('Kept existing .claude/settings.json unchanged; no settings template needed activation.') "$kind did not report the idempotent repeat state.`n$($second.Output)"
+    Assert-BytesEqual $activatedBytes ([IO.File]::ReadAllBytes($settingsPath)) "$kind changed activated settings on a repeated run."
+    Assert-True (-not (Test-Path -LiteralPath $templatePath)) "$kind recreated the settings template on a repeated run."
+}
+
 try {
     [IO.Directory]::CreateDirectory($tempRoot) | Out-Null
     $author = 'A O''Connor "quoted" \ $(touch INIT_AUTHOR_SUBSTITUTION); `touch INIT_AUTHOR_BACKTICK`'
@@ -438,7 +481,10 @@ try {
         $root = Join-Path $tempRoot "positive-$kind"
         $roots[$kind] = $root
         Copy-Template $root
-        $null = Invoke-Initializer $kind $root $author $authorEmail $githubOwner
+        $result = Invoke-Initializer $kind $root $author $authorEmail $githubOwner
+        Assert-True $result.Output.Contains('Activated .claude/settings.json') "$kind did not activate settings when the destination was absent.`n$($result.Output)"
+        Assert-True (Test-Path -LiteralPath (Join-Path $root '.claude/settings.json') -PathType Leaf) "$kind did not create .claude/settings.json."
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $root '.claude/settings.json.template'))) "$kind left the template after activation."
         Assert-GeneratedIdentity $root $author $authorEmail $githubOwner
         Assert-FreshProjectChangelog $root
         Test-GeneratedSyntaxAndExecution $root $author $authorEmail
@@ -473,9 +519,11 @@ try {
         Test-RejectedInput $kind 'email-newline' 'Valid Author' "first`nsecond@example.invalid" 'valid-owner' $emailDiagnostic
         Test-OwnerBoundary $kind 'a' 'minimum'
         Test-OwnerBoundary $kind ("a$('-' * 37)z") 'maximum'
+        Test-ExistingSettingsPreserved $kind
+        Test-SettingsActivationAndRepeat $kind
     }
 
-    Write-Host 'PASS: metadata initialization and release version selection are equivalent, syntax-valid, failure-safe, and injection-safe.' -ForegroundColor Green
+    Write-Host 'PASS: metadata and settings initialization are equivalent, idempotent, syntax-valid, failure-safe, and injection-safe.' -ForegroundColor Green
 }
 finally {
     if (Test-Path -LiteralPath $tempRoot) {

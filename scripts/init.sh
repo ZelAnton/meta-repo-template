@@ -95,6 +95,12 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 self="$script_dir/$(basename "$0")"
 sibling_ps1="$script_dir/init.ps1"
+claude_settings="$repo_root/.claude/settings.json"
+claude_template="$repo_root/.claude/settings.json.template"
+has_existing_claude_settings=0
+if [ -e "$claude_settings" ] || [ -L "$claude_settings" ]; then
+  has_existing_claude_settings=1
+fi
 
 # META(%%): XML-manifest languages (.NET) must XML-escape values written into project
 # files. Non-XML languages (Rust TOML, Gradle KTS) can drop xml_escape and the
@@ -141,13 +147,17 @@ replace_tokens() {
 echo "==> Initializing template as '$project_name'"
 
 # 1) Replace tokens in file contents. Both initializers are skipped (they carry the
-#    literal token strings as search keys). Excluded dirs are pruned.
+#    literal token strings as search keys). An existing user settings file is opaque
+#    and must survive byte-for-byte. Excluded dirs are pruned.
 # META(%%): add your build dirs to the -prune list (e.g. -o -name target -o -name build).
 changed=0
 while IFS= read -r -d '' file; do
   case "$file" in
     "$self"|"$sibling_ps1") continue ;;
   esac
+  if [ "$file" = "$claude_settings" ]; then
+    continue
+  fi
   # Skip binary files (NUL bytes get stripped through command substitution).
   case "$file" in
     *.snk|*.pfx|*.png|*.jpg|*.jpeg|*.gif|*.ico|*.zip|*.jar) continue ;;
@@ -185,9 +195,21 @@ done < <(find "$repo_root" -depth -name '*__ProjectName__*' -print0)
 # META(%%): language-specific post-processing here if needed (e.g. Kotlin package-dir move).
 
 # 3) Activate the Claude Code shared settings.
-if [ -f "$repo_root/.claude/settings.json.template" ]; then
-  mv -f "$repo_root/.claude/settings.json.template" "$repo_root/.claude/settings.json"
-  echo "    Activated .claude/settings.json"
+if [ "$has_existing_claude_settings" -eq 1 ]; then
+  if [ -f "$claude_template" ]; then
+    echo "    Kept existing .claude/settings.json unchanged; left .claude/settings.json.template in place."
+  else
+    echo "    Kept existing .claude/settings.json unchanged; no settings template needed activation."
+  fi
+elif [ -f "$claude_template" ]; then
+  if ln "$claude_template" "$claude_settings" 2>/dev/null; then
+    rm "$claude_template"
+    echo "    Activated .claude/settings.json"
+  elif [ -e "$claude_settings" ] || [ -L "$claude_settings" ]; then
+    echo "    Kept existing .claude/settings.json unchanged; left .claude/settings.json.template in place."
+  else
+    die "could not activate .claude/settings.json without overwriting a destination."
+  fi
 fi
 
 # 4) Remove template-only files.
