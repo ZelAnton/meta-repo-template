@@ -470,6 +470,53 @@ function Test-SettingsActivationAndRepeat([ValidateSet('pwsh', 'bash')][string]$
     Assert-True (-not (Test-Path -LiteralPath $templatePath)) "$kind recreated the settings template on a repeated run."
 }
 
+function Test-ExcludedStatePreserved([ValidateSet('pwsh', 'bash')][string]$kind) {
+    $root = Join-Path $tempRoot "excluded-state-$kind"
+    Copy-Template $root
+
+    $fixtures = @(
+        '.work/queue/__ProjectName__-pending.state',
+        'nested/.inbox/messages/__ProjectName__-message.state',
+        'nested/one/.git/refs/__ProjectName__-ref.state',
+        'nested/one/two/.jj/state/__ProjectName__-operation.state',
+        'nested/one/two/three/bin/__ProjectName__-output.state',
+        'nested/one/two/three/four/obj/__ProjectName__-cache.state'
+    )
+    $expectedBytes = @{}
+    foreach ($relativePath in $fixtures) {
+        $path = Join-Path $root $relativePath
+        [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path)) | Out-Null
+        $payload = [byte[]](@(0xEF, 0xBB, 0xBF, 0x00, 0xFF) + [Text.Encoding]::UTF8.GetBytes(
+            "path=$relativePath`r`nproject=__ProjectName__`nauthor=__Author__"
+        ))
+        [IO.File]::WriteAllBytes($path, $payload)
+        $expectedBytes[$relativePath] = $payload
+    }
+
+    $ordinarySource = Join-Path $root 'ordinary/__ProjectName__-project.txt'
+    [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($ordinarySource)) | Out-Null
+    [IO.File]::WriteAllText(
+        $ordinarySource,
+        'project=__ProjectName__; author=__Author__',
+        $utf8NoBom
+    )
+
+    $null = Invoke-Initializer $kind $root 'Preservation Author' 'preservation@example.invalid' 'preservation-owner'
+
+    foreach ($relativePath in $fixtures) {
+        $path = Join-Path $root $relativePath
+        $renamedPath = Join-Path $root $relativePath.Replace('__ProjectName__', 'Acme.Metadata')
+        Assert-True (Test-Path -LiteralPath $path -PathType Leaf) "$kind renamed excluded state path '$relativePath'."
+        Assert-True (-not (Test-Path -LiteralPath $renamedPath)) "$kind created a renamed excluded state path for '$relativePath'."
+        Assert-BytesEqual $expectedBytes[$relativePath] ([IO.File]::ReadAllBytes($path)) "$kind changed bytes in excluded state path '$relativePath'."
+    }
+
+    $ordinaryResult = Join-Path $root 'ordinary/Acme.Metadata-project.txt'
+    Assert-True (-not (Test-Path -LiteralPath $ordinarySource)) "$kind did not rename an ordinary project path."
+    Assert-True (Test-Path -LiteralPath $ordinaryResult -PathType Leaf) "$kind did not create the renamed ordinary project path."
+    Assert-Equal 'project=Acme.Metadata; author=Preservation Author' ([IO.File]::ReadAllText($ordinaryResult)) "$kind did not substitute ordinary project content."
+}
+
 try {
     [IO.Directory]::CreateDirectory($tempRoot) | Out-Null
     $author = 'A O''Connor "quoted" \ $(touch INIT_AUTHOR_SUBSTITUTION); `touch INIT_AUTHOR_BACKTICK`'
@@ -521,6 +568,7 @@ try {
         Test-OwnerBoundary $kind ("a$('-' * 37)z") 'maximum'
         Test-ExistingSettingsPreserved $kind
         Test-SettingsActivationAndRepeat $kind
+        Test-ExcludedStatePreserved $kind
     }
 
     Write-Host 'PASS: metadata and settings initialization are equivalent, idempotent, syntax-valid, failure-safe, and injection-safe.' -ForegroundColor Green
