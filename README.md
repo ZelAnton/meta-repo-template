@@ -14,6 +14,10 @@
 > meta-tokens get filled in once), lists every file to touch, and walks the
 > happy path.
 >
+> Before copying the meta-template, run
+> `pwsh ./tests/init-metadata.tests.ps1` to verify PowerShell/Bash initializer
+> parity and generated release-metadata safety.
+>
 > Everything below this block is the README the *generated* template ships.
 <!-- META:end -->
 

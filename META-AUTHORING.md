@@ -163,6 +163,7 @@ Caveats:
 | `scripts/init.sh` | S | POSIX counterpart of init.ps1 |
 | `src/__ProjectName__/Greeter.%%FileExt%%` | STUB | real sample API; rename `%%FileExt%%` |
 | `tests/__ProjectName__.Tests/GreeterTests.%%FileExt%%` | STUB | real sample test |
+| `tests/init-metadata.tests.ps1` | V | initializer metadata safety/parity regression; project init removes it |
 | build manifest + config | STUB | see `BUILD-SYSTEM.TODO.md` |
 
 ## 5. The build-manifest step
@@ -227,18 +228,22 @@ See `BUILD-SYSTEM.TODO.md` for the per-ecosystem file list. Key points:
 
 ## 8. Verification
 
-1. **No stray meta-tokens, markers, or TODOs:** `grep -rnE '%%|META:|TODO\(meta' .`
+1. **Initializer metadata safety and parity:** run
+   `pwsh ./tests/init-metadata.tests.ps1`. It exercises both initializers in
+   isolated copies, validates their generated Bash/Python/CODEOWNERS contexts, and
+   verifies rejected metadata leaves the template unchanged.
+2. **No stray meta-tokens, markers, or TODOs:** `grep -rnE '%%|META:|TODO\(meta' .`
    over the finished template returns nothing (ignore `.git`/`.jj`). This single
    pattern catches the `%%Token%%` slots, the `META(%%):` banners, the
    `<!-- META: keep/author … -->` / `<!-- META:start/end -->` markers, and the
    `TODO(meta:)` steps. Separately, `grep -rn '__[A-Za-z]' .` should show *only* the
    intended project tokens — the generated template's init script resolves those.
-2. **Workflows intact:** `release.yml`/`ci.yml` still contain their `${{ ... }}`
+3. **Workflows intact:** `release.yml`/`ci.yml` still contain their `${{ ... }}`
    expressions and `<<'PY'` heredocs unaltered.
-3. **It builds:** run the generated template's own `scripts/init.ps1`
+4. **It builds:** run the generated template's own `scripts/init.ps1`
    (`-ProjectName Acme.Widgets`) in a throwaway copy, then `%%BuildCmd%%` +
    `%%TestCmd%%` — the sample API and test must build and pass.
-4. **Regression check (optional but recommended):** author "C# from meta", fill the
+5. **Regression check (optional but recommended):** author "C# from meta", fill the
    slots from the table above, add the manifest, and confirm `git diff` against
    `cSharp-repo-template` is empty except for intentional differences. If the guide
    plus slots can regenerate a known-good sibling, it can author a new one.
