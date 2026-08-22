@@ -7,6 +7,7 @@ $PSNativeCommandUseErrorActionPreference = $false
 $sourceRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("meta-init-metadata-$([guid]::NewGuid().ToString('N'))")
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
+$metaMaintenanceNote = 'Template initialization now rejects multiline release identities and invalid GitHub owners while preserving shell metacharacters without release-workflow injection.'
 
 function Assert-True([bool]$condition, [string]$message) {
     if (-not $condition) { throw $message }
@@ -183,6 +184,27 @@ function Assert-GeneratedIdentity(
     Assert-True $license.Contains("Copyright (c) 2042 $author") 'Generated LICENSE author was not preserved exactly.'
 }
 
+function Assert-FreshProjectChangelog([string]$root) {
+    $changelog = [IO.File]::ReadAllText((Join-Path $root 'CHANGELOG.md'))
+    Assert-True (-not $changelog.Contains($metaMaintenanceNote)) 'Generated CHANGELOG leaked the meta-template maintenance note.'
+
+    $unreleasedMatch = [regex]::Match(
+        $changelog,
+        '(?ms)^## \[Unreleased\]\s*\r?\n(?<body>.*?)(?=^## \[|\z)'
+    )
+    Assert-True $unreleasedMatch.Success 'Generated CHANGELOG has no [Unreleased] section.'
+    $unreleasedBody = $unreleasedMatch.Groups['body'].Value.Replace("`r`n", "`n")
+
+    foreach ($heading in @('Added', 'Changed', 'Fixed')) {
+        Assert-True $unreleasedBody.Contains("### $heading`n-") "Generated CHANGELOG lost the empty $heading placeholder."
+    }
+
+    $hasManualReleaseNote = @($unreleasedBody -split "`n" | Where-Object {
+        $_ -match '^-\s+\S'
+    }).Count -gt 0
+    Assert-True (-not $hasManualReleaseNote) 'The first-release manual-note detector selected a generated [Unreleased] entry.'
+}
+
 function Test-GeneratedSyntaxAndExecution(
     [string]$root,
     [string]$author,
@@ -292,6 +314,7 @@ try {
         Copy-Template $root
         $null = Invoke-Initializer $kind $root $author $authorEmail $githubOwner
         Assert-GeneratedIdentity $root $author $authorEmail $githubOwner
+        Assert-FreshProjectChangelog $root
         Test-GeneratedSyntaxAndExecution $root $author $authorEmail
     }
 

@@ -16,6 +16,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
-- Template initialization now rejects multiline release identities and invalid GitHub owners while preserving shell metacharacters without release-workflow injection.
+-
 
 [Unreleased]: https://github.com/__GitHubOwner__/__ProjectName__/commits/main

@@ -17,6 +17,16 @@ into a concrete per-language template such as `go-repo-template` or
 > its CI runs normally once the workflow steps are filled — do not copy this setting
 > forward. Lint the meta-repo's own YAML locally with `yamllint .`.
 
+## Meta-template maintenance log
+
+This log belongs to `meta-repo-template` itself. Keep these entries out of
+`CHANGELOG.md`, which ships as the fresh project's changelog with an empty
+`[Unreleased]` section.
+
+- 2026-08-22: Template initialization now rejects multiline release identities and
+  invalid GitHub owners while preserving shell metacharacters without
+  release-workflow injection.
+
 ## 1. What this is, and the two-token model
 
 `meta-repo-template` mirrors the file tree of a real language template
