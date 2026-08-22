@@ -174,14 +174,15 @@ while IFS= read -r -d '' file; do
     printf '%s' "$content" > "$file"
     changed=$((changed + 1))
   fi
-done < <(find "$repo_root" -type d \( -name .git -o -name .jj -o -name bin -o -name obj \) -prune -o -type f -print0)
+done < <(find "$repo_root" -type d \( -name .git -o -name .jj -o -name .work -o -name .inbox -o -name bin -o -name obj \) -prune -o -type f -print0)
 echo "    Updated contents in $changed file(s)."
 
 # 2) Rename files and folders whose name contains the project-name token. -depth
 #    processes children before parents (deepest paths first).
 while IFS= read -r -d '' item; do
-  case "$item" in
-    */.git/*|*/.jj/*|*/bin/*|*/obj/*) continue ;;
+  relative_item="${item#"$repo_root"/}"
+  case "/$relative_item/" in
+    */.git/*|*/.jj/*|*/.work/*|*/.inbox/*|*/bin/*|*/obj/*) continue ;;
   esac
   dir="$(dirname "$item")"
   base="$(basename "$item")"

@@ -120,7 +120,7 @@ $xmlFileExtensions = @('.csproj', '.fsproj', '.props', '.targets', '.slnx', '.co
 $binaryExtensions = @('.snk', '.pfx', '.png', '.jpg', '.jpeg', '.gif', '.ico', '.zip', '.jar')
 
 # META(%%): add your build output/cache dirs (e.g. 'target', 'build', '.gradle').
-$excludedDirs = @('.git', '.jj', 'bin', 'obj')
+$excludedDirs = @('.git', '.jj', '.work', '.inbox', 'bin', 'obj')
 
 function Test-Excluded([string]$fullPath) {
     $rel = $fullPath.Substring($repoRoot.Length).TrimStart('\', '/')
