@@ -306,7 +306,9 @@ try {
         @{ Name = 'backtick'; Value = 'bad`owner' },
         @{ Name = 'substitution'; Value = '$(touch INIT_OWNER_SUBSTITUTION)' },
         @{ Name = 'backslash'; Value = 'bad\owner' },
-        @{ Name = 'newline'; Value = "bad`nowner" }
+        @{ Name = 'newline'; Value = "bad`nowner" },
+        @{ Name = 'trailing-lf'; Value = "valid-owner`n" },
+        @{ Name = 'trailing-crlf'; Value = "valid-owner`r`n" }
     )
     foreach ($kind in @('pwsh', 'bash')) {
         $ownerDiagnostic = if ($kind -eq 'pwsh') { 'githubowner' } else { 'github-owner' }

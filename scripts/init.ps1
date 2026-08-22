@@ -83,7 +83,7 @@ foreach ($field in @(
     }
 }
 
-if ($GitHubOwner -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$') {
+if ($GitHubOwner -notmatch '\A[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\z') {
     throw 'Invalid -GitHubOwner. Use 1-39 letters, digits, or hyphens, with no leading or trailing hyphen. No files were changed.'
 }
 
