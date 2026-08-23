@@ -17,6 +17,9 @@
 #       [--github-owner acme] [--description "Widget toolkit"] \
 #       [--year 2026] [--keep-script]
 #
+# Runtime requirements: Bash, iconv (strict UTF-8 validation), and Perl (byte-safe
+# token replacement). The initializer fails closed when iconv or Perl is unavailable.
+#
 # Author and author-email values must be single-line; release-workflow use is
 # serialized so shell metacharacters remain literal. GitHub owner values must be
 # 1-39 letters, digits, or internal hyphens.
@@ -86,6 +89,8 @@ has_existing_claude_settings=0
 # content would otherwise produce a partially initialized project.
 utf8_validator="$(command -v iconv 2>/dev/null || true)"
 [ -n "$utf8_validator" ] || die "iconv is required for strict UTF-8 validation. Install iconv and rerun."
+perl_validator="$(command -v perl 2>/dev/null || true)"
+[ -n "$perl_validator" ] || die "perl is required for byte-safe token replacement. Install perl and rerun."
 
 failure_phase="${META_INIT_TEST_FAIL_PHASE:-}"
 case "$failure_phase" in
