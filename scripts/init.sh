@@ -36,6 +36,7 @@ year=""
 keep_script=0
 internal_recover_only="${META_INIT_RECOVER_ONLY:-}"
 internal_recovery_parent_token="${META_INIT_RECOVERY_PARENT_TOKEN:-}"
+internal_allow_empty_transaction=0
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -50,6 +51,7 @@ while [ $# -gt 0 ]; do
     --keep-script)  keep_script=1; shift ;;
     --internal-recover-only) internal_recover_only=1; shift ;;
     --internal-recovery-parent-token) internal_recovery_parent_token="${2:-}"; shift 2 ;;
+    --internal-allow-empty-transaction) internal_allow_empty_transaction=1; shift ;;
     -h|--help)      sed -n '2,20p' "$0"; exit 0 ;;
     *)              die "unknown argument: $1" ;;
   esac
@@ -261,8 +263,11 @@ recovery_only="$internal_recover_only"
 
 journal_state=""
 journal_root=""
+journal_version=""
+journal_engine=""
 journal_content_paths=()
 journal_content_backups=()
+journal_content_stages=()
 journal_content_modes=()
 journal_rename_sources=()
 journal_rename_destinations=()
@@ -323,6 +328,171 @@ resolve_windows_pwsh() {
   if command -v pwsh.exe >/dev/null 2>&1; then printf '%s' pwsh.exe; return 0; fi
   if [ "${OS:-}" = Windows_NT ] && command -v pwsh >/dev/null 2>&1; then printf '%s' pwsh; return 0; fi
   return 1
+}
+
+stat_owner() {
+  local value
+  if value="$(stat -c '%u' -- "$1" 2>/dev/null)"; then :
+  elif value="$(stat -f '%u' -- "$1" 2>/dev/null)"; then :
+  else return 1
+  fi
+  case "$value" in *[!0-9]*|'') return 1 ;; esac
+  printf '%s' "$value"
+}
+
+set_private_windows_transaction_root() {
+  local pwsh_command path_b64 windows_path
+  pwsh_command="$(resolve_windows_pwsh)" || return 1
+  command -v cygpath >/dev/null 2>&1 || return 1
+  windows_path="$(cygpath -aw "$transaction_root")" || return 1
+  path_b64="$(encode_path "$windows_path")"
+  META_INIT_TRANSACTION_PATH_B64="$path_b64" "$pwsh_command" -NoProfile -NonInteractive -Command '
+    $ErrorActionPreference = "Stop"
+    $path = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:META_INIT_TRANSACTION_PATH_B64))
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    & icacls.exe $path "/inheritance:r" "/grant:r" ("*" + $sid + ":(OI)(CI)F") | Out-Null
+    if ($LASTEXITCODE -ne 0) { exit 11 }
+  ' >/dev/null
+}
+
+assert_private_windows_transaction_tree() {
+  local full_check="${1:-1}" pwsh_command path_b64 windows_path
+  pwsh_command="$(resolve_windows_pwsh)" || return 1
+  command -v cygpath >/dev/null 2>&1 || return 1
+  windows_path="$(cygpath -aw "$transaction_root")" || return 1
+  path_b64="$(encode_path "$windows_path")"
+  META_INIT_TRANSACTION_PATH_B64="$path_b64" META_INIT_TRANSACTION_FULL_CHECK="$full_check" "$pwsh_command" -NoProfile -NonInteractive -Command '
+    $ErrorActionPreference = "Stop"
+    $root = [IO.Path]::GetFullPath([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:META_INIT_TRANSACTION_PATH_B64)))
+    $fullCheck = $env:META_INIT_TRANSACTION_FULL_CHECK -eq "1"
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $items = @((Get-Item -LiteralPath $root -Force -ErrorAction Stop)) +
+      @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop)
+    foreach ($item in $items) {
+      if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.LinkType) {
+        throw "linked transaction path"
+      }
+      if ($fullCheck -or $item.FullName -eq $root) {
+        $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
+        if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid) {
+          throw "foreign transaction owner"
+        }
+        $foreignAllows = @($acl.Access | Where-Object {
+          if ($_.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { return $false }
+          $ruleSid = try { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { "" }
+          $ruleSid -ne $sid
+        })
+        if ($foreignAllows.Count -gt 0) { throw "non-private transaction ACL" }
+        if ($item.FullName -eq $root -and -not $acl.AreAccessRulesProtected) {
+          throw "inherited transaction ACL"
+        }
+      }
+    }
+  ' >/dev/null
+}
+
+assert_private_posix_transaction_item() {
+  local path="$1" expected_mode="$2" owner mode current_uid
+  current_uid="$(id -u 2>/dev/null)" || return 1
+  owner="$(stat_owner "$path")" || return 1
+  [ "$owner" = "$current_uid" ] || return 1
+  mode="$(stat_mode "$path")" || return 1
+  [ "$mode" = "$expected_mode" ]
+}
+
+assert_private_transaction_directory() {
+  local directory="$1" path links
+  local -a entries
+  shopt -s nullglob dotglob
+  entries=("$directory"/*)
+  shopt -u nullglob dotglob
+  for path in "${entries[@]}"; do
+    [ ! -L "$path" ] || return 1
+    if [ -d "$path" ]; then
+      if [ "${OS:-}" != Windows_NT ]; then
+        assert_private_posix_transaction_item "$path" 700 || return 1
+      fi
+      assert_private_transaction_directory "$path" || return 1
+    elif [ -f "$path" ]; then
+      links="$(stat_links "$path")" || return 1
+      [ "$links" -eq 1 ] || return 1
+      if [ "${OS:-}" != Windows_NT ]; then
+        assert_private_posix_transaction_item "$path" 600 || return 1
+      fi
+    else
+      return 1
+    fi
+  done
+}
+
+assert_private_transaction_tree() {
+  [ -d "$transaction_root" ] && [ ! -L "$transaction_root" ] || {
+    echo "error: transaction root '$transaction_root' is not an owned regular directory. Refusing unsafe recovery." >&2
+    return 1
+  }
+  if [ "${OS:-}" = Windows_NT ]; then
+    assert_private_windows_transaction_tree 1 || {
+      echo "error: transaction root '$transaction_root' has an insecure owner, ACL, or link boundary. Refusing unsafe recovery." >&2
+      return 1
+    }
+    return 0
+  else
+    assert_private_posix_transaction_item "$transaction_root" 700 || {
+      echo "error: transaction root '$transaction_root' has an insecure owner or mode. Refusing unsafe recovery." >&2
+      return 1
+    }
+  fi
+  assert_private_transaction_directory "$transaction_root" || {
+    echo "error: transaction tree '$transaction_root' contains an insecure link, owner, mode, or file type. Refusing unsafe recovery." >&2
+    return 1
+  }
+}
+
+assert_owned_transaction_tree() {
+  [ -d "$transaction_root" ] && [ ! -L "$transaction_root" ] || return 1
+  if [ "${OS:-}" = Windows_NT ]; then
+    assert_private_windows_transaction_tree 0
+    return
+  fi
+  assert_private_posix_transaction_item "$transaction_root" 700 &&
+    assert_private_transaction_directory "$transaction_root"
+}
+
+assert_transaction_root_entry() {
+  [ -d "$transaction_root" ] && [ ! -L "$transaction_root" ]
+}
+
+validate_recovery_repo_path() {
+  local path="$1" purpose="$2" relative cursor
+  [ -n "$path" ] || { echo "error: recovery $purpose path is empty." >&2; return 1; }
+  case "$path" in *$'\n'*|*$'\r'*) echo "error: recovery $purpose path contains a line break." >&2; return 1 ;; esac
+  case "$path" in "$repo_root"|"$repo_root"/*) ;; *) echo "error: recovery $purpose path '$path' escapes the repository." >&2; return 1 ;; esac
+  relative="${path#"$repo_root"/}"
+  case "/$relative/" in *'/../'*|*'/./'*|*'//'*) echo "error: recovery $purpose path '$path' is not canonical." >&2; return 1 ;; esac
+  case "$path" in */) echo "error: recovery $purpose path '$path' is not canonical." >&2; return 1 ;; esac
+  cursor="$path"
+  while [ "$cursor" != "$repo_root" ]; do
+    [ ! -L "$cursor" ] || { echo "error: recovery $purpose path '$path' uses a symbolic link." >&2; return 1; }
+    cursor="${cursor%/*}"
+    [ -n "$cursor" ] || return 1
+  done
+}
+
+validate_recovery_file_if_present() {
+  local path="$1" purpose="$2" allow_settings_pair="${3:-0}" links
+  validate_recovery_repo_path "$path" "$purpose" || return 1
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ -f "$path" ] && [ ! -L "$path" ] || { echo "error: recovery $purpose path '$path' is not a regular file." >&2; return 1; }
+    if [ "$allow_settings_pair" -ne 1 ]; then
+      links="$(stat_links "$path")" || return 1
+      [ "$links" -eq 1 ] || { echo "error: recovery $purpose path '$path' is hard-linked." >&2; return 1; }
+    fi
+  fi
+}
+
+valid_journal_mode() {
+  case "$1" in ''|*[!0-7]*) return 1 ;; esac
+  [ "${#1}" -ge 3 ] && [ "${#1}" -le 4 ]
 }
 
 if [ "${OS:-}" = Windows_NT ]; then
@@ -464,53 +634,145 @@ release_coordination() {
 }
 
 load_manifest() {
-  local type first second third
-  journal_state=""; journal_root=""
-  journal_content_paths=(); journal_content_backups=(); journal_content_modes=()
+  local type first second third extra decoded index backup_relative settings_extra links
+  journal_state=""; journal_root=""; journal_version=""; journal_engine=""
+  journal_content_paths=(); journal_content_backups=(); journal_content_stages=(); journal_content_modes=()
   journal_rename_sources=(); journal_rename_destinations=()
   journal_cleanup_paths=(); journal_cleanup_backups=(); journal_cleanup_modes=()
   journal_settings_template=""; journal_settings_destination=""; journal_settings_backup=""; journal_settings_mode=""
   journal_docs=""; journal_deferred=()
-  while IFS='|' read -r type first second third <&9; do
+  declare -A seen_scalar=() seen_content=() seen_rename=() seen_cleanup=() seen_deferred=() seen_transaction=()
+  while IFS='|' read -r type first second third extra <&9; do
+    case "$type$first$second$third$extra" in *$'\r'*|*$'\n'*) echo "error: recovery manifest contains a line break in a field." >&2; return 1 ;; esac
     case "$type" in
-      ROOT) journal_root="$(decode_path "$first")" ;;
-      STATE) journal_state="$first" ;;
+      VERSION)
+        [ -n "$first" ] && [ -z "$second$third$extra" ] && [ -z "${seen_scalar[VERSION]+set}" ] || return 1
+        seen_scalar[VERSION]=1; journal_version="$first" ;;
+      ENGINE)
+        [ -n "$first" ] && [ -z "$second$third$extra" ] && [ -z "${seen_scalar[ENGINE]+set}" ] || return 1
+        seen_scalar[ENGINE]=1; journal_engine="$first" ;;
+      ROOT)
+        [ -n "$first" ] && [ -z "$second$third$extra" ] && [ -z "${seen_scalar[ROOT]+set}" ] || return 1
+        seen_scalar[ROOT]=1; journal_root="$(decode_path "$first")" || return 1 ;;
+      STATE)
+        [ -n "$first" ] && [ -z "$second$third$extra" ] && [ -z "${seen_scalar[STATE]+set}" ] || return 1
+        seen_scalar[STATE]=1; journal_state="$first" ;;
       CONTENT)
-        journal_content_paths+=("$(decode_path "$first")")
+        [ -n "$first" ] && [ -n "$second" ] && [ -n "$third" ] && [ -z "$extra" ] || return 1
+        index="${#journal_content_paths[@]}"
+        [ "$second" = "content-backup/$index" ] && valid_journal_mode "$third" || return 1
+        decoded="$(decode_path "$first")" || return 1
+        validate_recovery_file_if_present "$decoded" content || return 1
+        [ -z "${seen_content["$decoded"]+set}" ] || return 1
+        seen_content["$decoded"]=1
+        journal_content_paths+=("$decoded")
         journal_content_backups+=("$transaction_root/$second")
-        journal_content_modes+=("$third") ;;
+        journal_content_stages+=("$transaction_root/content-stage/$index")
+        journal_content_modes+=("$third")
+        [ -z "${seen_transaction["$transaction_root/$second"]+set}" ] || return 1
+        seen_transaction["$transaction_root/$second"]=1
+        seen_transaction["$transaction_root/content-stage/$index"]=1 ;;
       RENAME)
-        journal_rename_sources+=("$(decode_path "$first")")
-        journal_rename_destinations+=("$(decode_path "$second")") ;;
+        [ -n "$first" ] && [ -n "$second" ] && [ -z "$third$extra" ] || return 1
+        decoded="$(decode_path "$first")" || return 1
+        validate_recovery_repo_path "$decoded" 'rename source' || return 1
+        [ -z "${seen_rename["$decoded"]+set}" ] || return 1
+        seen_rename["$decoded"]=1
+        journal_rename_sources+=("$decoded")
+        decoded="$(decode_path "$second")" || return 1
+        validate_recovery_repo_path "$decoded" 'rename destination' || return 1
+        [ -z "${seen_rename["$decoded"]+set}" ] || return 1
+        seen_rename["$decoded"]=1
+        journal_rename_destinations+=("$decoded") ;;
       CLEANUP)
-        journal_cleanup_paths+=("$(decode_path "$first")")
+        [ -n "$first" ] && [ -n "$second" ] && [ -n "$third" ] && [ -z "$extra" ] || return 1
+        index="${#journal_cleanup_paths[@]}"
+        [ "$second" = "cleanup-backup/$index" ] && valid_journal_mode "$third" || return 1
+        decoded="$(decode_path "$first")" || return 1
+        validate_recovery_file_if_present "$decoded" cleanup || return 1
+        [ -z "${seen_cleanup["$decoded"]+set}" ] || return 1
+        seen_cleanup["$decoded"]=1
+        journal_cleanup_paths+=("$decoded")
         journal_cleanup_backups+=("$transaction_root/$second")
-        journal_cleanup_modes+=("$third") ;;
+        journal_cleanup_modes+=("$third")
+        [ -z "${seen_transaction["$transaction_root/$second"]+set}" ] || return 1
+        seen_transaction["$transaction_root/$second"]=1 ;;
       SETTINGS)
-        journal_settings_template="$(decode_path "$first")"
-        journal_settings_destination="$(decode_path "$second")"
-        IFS=',' read -r journal_settings_backup journal_settings_mode <<< "$third"
-        journal_settings_backup="$transaction_root/$journal_settings_backup" ;;
-      DOCS) journal_docs="$(decode_path "$first")" ;;
-      DEFERRED) journal_deferred+=("$(decode_path "$first")") ;;
+        [ -n "$first" ] && [ -n "$second" ] && [ -n "$third" ] && [ -z "$extra" ] && [ -z "${seen_scalar[SETTINGS]+set}" ] || return 1
+        seen_scalar[SETTINGS]=1
+        journal_settings_template="$(decode_path "$first")" || return 1
+        journal_settings_destination="$(decode_path "$second")" || return 1
+        validate_recovery_file_if_present "$journal_settings_template" 'settings template' 1 || return 1
+        validate_recovery_file_if_present "$journal_settings_destination" 'settings destination' 1 || return 1
+        IFS=',' read -r backup_relative journal_settings_mode settings_extra <<< "$third"
+        [ "$backup_relative" = settings-template ] && [ -z "$settings_extra" ] && valid_journal_mode "$journal_settings_mode" || return 1
+        journal_settings_backup="$transaction_root/$backup_relative"
+        [ -z "${seen_transaction["$journal_settings_backup"]+set}" ] || return 1
+        seen_transaction["$journal_settings_backup"]=1 ;;
+      DOCS)
+        [ -n "$first" ] && [ -z "$second$third$extra" ] && [ -z "${seen_scalar[DOCS]+set}" ] || return 1
+        seen_scalar[DOCS]=1; journal_docs="$(decode_path "$first")" || return 1
+        validate_recovery_repo_path "$journal_docs" 'docs directory' || return 1
+        [ "$journal_docs" = "$repo_root/docs" ] || return 1 ;;
+      DEFERRED)
+        [ -n "$first" ] && [ -z "$second$third$extra" ] || return 1
+        decoded="$(decode_path "$first")" || return 1
+        validate_recovery_file_if_present "$decoded" 'deferred cleanup' || return 1
+        [ -z "${seen_deferred["$decoded"]+set}" ] || return 1
+        seen_deferred["$decoded"]=1; journal_deferred+=("$decoded") ;;
+      *) echo "error: recovery manifest contains unknown record '$type'." >&2; return 1 ;;
     esac
   done 9< "$manifest_path"
+  [ "${seen_scalar[VERSION]:-}" = 1 ] && [ "$journal_version" = 1 ] || { echo "error: recovery manifest has an unsupported or missing VERSION." >&2; return 1; }
+  [ "${seen_scalar[ENGINE]:-}" = 1 ] && [ "$journal_engine" = bash ] || { echo "error: recovery manifest has the wrong or missing ENGINE." >&2; return 1; }
+  [ "${seen_scalar[ROOT]:-}" = 1 ] && [ "$journal_root" = "$repo_root" ] || { echo "error: recovery journal '$transaction_root' belongs to a different repository." >&2; return 1; }
+  [ "${seen_scalar[STATE]:-}" = 1 ] && { [ "$journal_state" = prepared ] || [ "$journal_state" = committed ]; } || { echo "error: recovery manifest has an unsupported or missing STATE." >&2; return 1; }
+
+  for ((index=0; index<${#journal_content_backups[@]}; index++)); do
+    [ -f "${journal_content_backups[$index]}" ] && [ ! -L "${journal_content_backups[$index]}" ] || return 1
+    [ -f "${journal_content_stages[$index]}" ] && [ ! -L "${journal_content_stages[$index]}" ] || return 1
+  done
+  for backup_relative in "${journal_cleanup_backups[@]}"; do
+    [ -f "$backup_relative" ] && [ ! -L "$backup_relative" ] || return 1
+  done
+  if [ -n "$journal_settings_backup" ]; then
+    [ -f "$journal_settings_backup" ] && [ ! -L "$journal_settings_backup" ] || return 1
+    if [ -e "$journal_settings_template" ] && [ -e "$journal_settings_destination" ]; then
+      [ "$journal_settings_template" -ef "$journal_settings_destination" ] || return 1
+      links="$(stat_links "$journal_settings_template")" || return 1
+      [ "$links" -eq 2 ] || return 1
+    else
+      validate_recovery_file_if_present "$journal_settings_template" 'settings template' || return 1
+      validate_recovery_file_if_present "$journal_settings_destination" 'settings destination' || return 1
+    fi
+  fi
+  for decoded in "${journal_deferred[@]}"; do
+    [ -n "${seen_cleanup["$decoded"]+set}" ] || return 1
+  done
 }
 
 restore_transaction() {
   local failed=0 index path source destination backup mode actual_mode
-  load_manifest || return 1
+  load_manifest || {
+    echo "error: recovery manifest is malformed. Refusing unsafe recovery." >&2
+    return 1
+  }
   [ "$journal_root" = "$repo_root" ] || {
     echo "error: recovery journal '$transaction_root' belongs to a different repository." >&2
     return 1
   }
   set +e
   if [ "$journal_state" = committed ]; then
-    for path in "${journal_deferred[@]}"; do rm -f -- "$path" || failed=1; done
+    for path in "${journal_deferred[@]}"; do
+      if validate_recovery_file_if_present "$path" 'deferred cleanup'; then rm -f -- "$path" || failed=1
+      else failed=1
+      fi
+    done
   elif [ "$journal_state" = prepared ]; then
     for ((index=0; index<${#journal_cleanup_paths[@]}; index++)); do
       path="${journal_cleanup_paths[$index]}"; backup="${journal_cleanup_backups[$index]}"
-      if ! { mkdir -p "$(dirname "$path")" && cp -p -- "$backup" "$path" && chmod "${journal_cleanup_modes[$index]}" "$path"; }; then
+      if ! { validate_recovery_file_if_present "$path" cleanup && mkdir -p "$(dirname "$path")" &&
+        cp -p -- "$backup" "$path" && chmod "${journal_cleanup_modes[$index]}" "$path"; }; then
         echo "error: could not restore cleanup path '$path'." >&2
         failed=1
       fi
@@ -534,7 +796,10 @@ restore_transaction() {
     fi
     for ((index=${#journal_rename_sources[@]}-1; index>=0; index--)); do
       source="${journal_rename_sources[$index]}"; destination="${journal_rename_destinations[$index]}"
-      if { [ -e "$source" ] || [ -L "$source" ]; } && { [ -e "$destination" ] || [ -L "$destination" ]; }; then
+      if ! validate_recovery_repo_path "$source" 'rename source' ||
+        ! validate_recovery_repo_path "$destination" 'rename destination'; then
+        failed=1
+      elif { [ -e "$source" ] || [ -L "$source" ]; } && { [ -e "$destination" ] || [ -L "$destination" ]; }; then
         failed=1
       elif [ -e "$destination" ] || [ -L "$destination" ]; then
         mv -- "$destination" "$source" || failed=1
@@ -544,7 +809,7 @@ restore_transaction() {
     done
     for ((index=0; index<${#journal_content_paths[@]}; index++)); do
       path="${journal_content_paths[$index]}"; backup="${journal_content_backups[$index]}"; mode="${journal_content_modes[$index]}"
-      if ! { cp -p -- "$backup" "$path" && chmod "$mode" "$path"; }; then
+      if ! { validate_recovery_file_if_present "$path" content && cp -p -- "$backup" "$path" && chmod "$mode" "$path"; }; then
         echo "error: could not restore content path '$path'." >&2
         failed=1
       fi
@@ -589,14 +854,22 @@ restore_transaction() {
     echo "error: automatic recovery was incomplete; private backups remain at '$transaction_root'." >&2
     return 1
   fi
+  assert_transaction_root_entry || return 1
   rm -rf -- "$transaction_root"
   echo "    Recovered an interrupted initialization transaction."
 }
 
 recover_native_transaction() {
-  if [ -d "$transaction_root" ]; then
-    if [ -f "$manifest_path" ]; then restore_transaction || return 1
-    else rm -rf -- "$transaction_root"
+  local allow_empty_transaction="${1:-0}"
+  if [ -e "$transaction_root" ] || [ -L "$transaction_root" ]; then
+    assert_private_transaction_tree || return 1
+    if [ -f "$manifest_path" ] && [ ! -L "$manifest_path" ]; then restore_transaction || return 1
+    elif [ "$allow_empty_transaction" -eq 1 ]; then
+      rm -rf -- "$transaction_root" || return 1
+      echo "    Recovered an interrupted preflight transaction."
+    else
+      echo "error: transaction root '$transaction_root' has no regular manifest. Refusing unsafe recovery." >&2
+      return 1
     fi
   fi
 }
@@ -621,7 +894,7 @@ invoke_pwsh_recovery_only() {
     cd "$repo_root"
     "$pwsh_command" -NoProfile -File ./scripts/init.ps1 \
       -ProjectName "$project_name" -KeepScript -InternalRecoverOnly \
-      -InternalRecoveryParentToken "$coordination_token"
+      -InternalRecoveryParentToken "$coordination_token" -InternalAllowEmptyTransaction
   )
 }
 
@@ -661,7 +934,7 @@ enter_coordination_and_recover() {
     existing_token="$owner_token"
   fi
 
-  if [ -z "$existing_token" ] && [ ! -d "$transaction_root" ]; then
+  if [ -z "$existing_token" ] && [ ! -e "$transaction_root" ] && [ ! -L "$transaction_root" ]; then
     acquire_coordination
     return
   fi
@@ -687,7 +960,9 @@ enter_coordination_and_recover() {
 
   acquire_coordination
   if [ "$existing_engine" = pwsh ]; then invoke_pwsh_recovery_only || return 2; fi
-  recover_native_transaction || return 2
+  if [ "$existing_engine" = bash ]; then recover_native_transaction 1 || return 2
+  else recover_native_transaction 0 || return 2
+  fi
   release_recovery_claim
 }
 
@@ -703,7 +978,7 @@ if [ "$recovery_only" = 1 ]; then
   if ! owner_status; then
     die "recovery-only mode could not validate the active parent coordination owner."
   fi
-  recover_native_transaction || exit 2
+  recover_native_transaction "$internal_allow_empty_transaction" || exit 2
   exit 0
 fi
 
@@ -726,7 +1001,9 @@ on_exit() {
   if [ "$transaction_active" -eq 1 ]; then
     rollback || exit_code=2
   elif [ "$owns_transaction" -eq 1 ] && [ -d "$transaction_root" ]; then
-    rm -rf -- "$transaction_root"
+    if assert_transaction_root_entry; then rm -rf -- "$transaction_root"
+    else exit_code=2
+    fi
   fi
   release_recovery_claim
   release_coordination
@@ -770,7 +1047,12 @@ if ! mkdir -- "$transaction_root"; then
   die "another initializer process acquired '$transaction_root'. No files were changed."
 fi
 owns_transaction=1
-[ "$(stat_mode "$transaction_root")" = 700 ] || die "could not restrict transaction directory '$transaction_root' to mode 0700. No files were changed."
+chmod 700 "$transaction_root"
+if [ "${OS:-}" = Windows_NT ]; then
+  set_private_windows_transaction_root || die "could not restrict transaction directory '$transaction_root' to the current Windows identity. No files were changed."
+else
+  assert_private_posix_transaction_item "$transaction_root" 700 || die "could not establish a private transaction directory at '$transaction_root'. No files were changed."
+fi
 
 # Preflight every path mutation before the source tree is changed. Enumeration is
 # captured in a real file so a traversal error cannot be hidden by process substitution.
@@ -956,6 +1238,7 @@ write_manifest() {
 
 # Every rollback record and backup is durable before the first source-tree write.
 write_manifest prepared
+assert_owned_transaction_tree || die "the prepared transaction tree is not private. No source files were changed."
 
 echo "==> Initializing template as '$project_name'"
 transaction_active=1
@@ -1031,7 +1314,7 @@ controlled_failure scripts
 write_manifest committed
 for path in "${deferred_cleanup[@]}"; do rm -f -- "$path"; done
 transaction_active=0
-if ! rm -rf -- "$transaction_root"; then
+if ! assert_transaction_root_entry || ! rm -rf -- "$transaction_root"; then
   echo "warning: initialization succeeded, but temporary backups could not be removed: $transaction_root" >&2
 fi
 owns_transaction=0

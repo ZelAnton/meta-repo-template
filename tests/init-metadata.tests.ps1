@@ -1,8 +1,8 @@
 #!/usr/bin/env pwsh
 [CmdletBinding()]
 param(
-    [ValidateSet('all', 'cross-bash-pwsh', 'cross-engine', 'cross-pwsh-bash', 'failure-io', 'quarantine', 'recovery-bash-pwsh', 'recovery-pwsh-bash', 'same-engine')]
-    [string]$TestScope = 'all'
+    [ValidateSet('quick', 'all', 'cross-bash-pwsh', 'cross-engine', 'cross-pwsh-bash', 'failure-io', 'hostile-recovery', 'quarantine', 'recovery-bash-pwsh', 'recovery-pwsh-bash', 'same-engine')]
+    [string]$TestScope = 'quick'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -161,7 +161,8 @@ function Invoke-Initializer(
         $authorEmail,
         $githubOwner,
         'Metadata safety fixture',
-        '2042'
+        '2042',
+        [string][Environment]::GetEnvironmentVariable('META_INIT_TEST_SKIP_CONTENT_PATH')
     ) | ForEach-Object { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($_)) }
     $runnerPath = Join-Path $root '.metadata-test-runner.sh'
     $runnerCrashPhase = [Environment]::GetEnvironmentVariable('META_INIT_TEST_CRASH_PHASE')
@@ -187,6 +188,8 @@ decode_value '$($encodedValues[2])' author_email
 decode_value '$($encodedValues[3])' github_owner
 decode_value '$($encodedValues[4])' description
 decode_value '$($encodedValues[5])' year
+decode_value '$($encodedValues[6])' skip_content_path
+export META_INIT_TEST_SKIP_CONTENT_PATH="`$skip_content_path"
 keep_script_args=()
 if [ '$($KeepScript.ToString().ToLowerInvariant())' = true ]; then
   keep_script_args+=(--keep-script)
@@ -258,6 +261,86 @@ function Get-PowerShellTransactionPath([string]$root) {
         [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($boundary))
     ).ToLowerInvariant()
     return Join-Path ([IO.Path]::GetTempPath()) "meta-init-transaction-$hash-pwsh"
+}
+
+function Get-BashTransactionPath([string]$root) {
+    $runnerPath = Join-Path $root '.metadata-transaction-path.sh'
+    $runner = @'
+#!/usr/bin/env bash
+set -euo pipefail
+repo_root="$(cd . && pwd)"
+if command -v sha256sum >/dev/null 2>&1; then
+  repo_hash="$(printf '%s' "$repo_root" | sha256sum | awk '{print $1}')"
+else
+  repo_hash="$(printf '%s' "$repo_root" | shasum -a 256 | awk '{print $1}')"
+fi
+transaction_parent="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+transaction_root="$transaction_parent/meta-init-transaction-$repo_hash-bash"
+if [ "${OS:-}" = Windows_NT ]; then cygpath -aw "$transaction_root"
+else printf '%s\n' "$transaction_root"
+fi
+'@
+    [IO.File]::WriteAllText($runnerPath, $runner.Replace("`r`n", "`n"), $utf8NoBom)
+    try {
+        return (Invoke-Captured 'bash' @('./.metadata-transaction-path.sh') $root).Output.Trim()
+    }
+    finally { Remove-Item -LiteralPath $runnerPath -Force -ErrorAction SilentlyContinue }
+}
+
+function Get-TransactionPath([ValidateSet('pwsh', 'bash')][string]$kind, [string]$root) {
+    if ($kind -eq 'pwsh') { return (Get-PowerShellTransactionPath $root) }
+    return (Get-BashTransactionPath $root)
+}
+
+function Remove-TestTransactionRoot([string]$transactionRoot) {
+    $item = Get-Item -LiteralPath $transactionRoot -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return }
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.LinkType) {
+        Remove-Item -LiteralPath $transactionRoot -Force -ErrorAction Stop
+    }
+    else {
+        Remove-Item -LiteralPath $transactionRoot -Recurse -Force -ErrorAction Stop
+    }
+}
+
+function Set-TestPrivateTransactionRoot([string]$transactionRoot) {
+    if ($IsWindows) {
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        & icacls.exe $transactionRoot '/inheritance:r' '/grant:r' "*$sid`:(OI)(CI)F" | Out-Null
+        Assert-True ($LASTEXITCODE -eq 0) 'Could not restore the private transaction ACL in a hostile-recovery fixture.'
+    }
+    else {
+        [IO.File]::SetUnixFileMode(
+            $transactionRoot,
+            [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute
+        )
+    }
+}
+
+function Write-TestTransactionManifest([string]$manifestPath, [string]$content) {
+    [IO.File]::WriteAllText($manifestPath, $content, $utf8NoBom)
+    if (-not $IsWindows) {
+        [IO.File]::SetUnixFileMode(
+            $manifestPath,
+            [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite
+        )
+    }
+}
+
+function Invoke-HostileRecoveryAttempt(
+    [ValidateSet('pwsh', 'bash')][string]$kind,
+    [string]$root,
+    [string]$before,
+    [string]$label,
+    [object[]]$externalFiles = @()
+) {
+    $result = Invoke-Initializer $kind $root 'Hostile Recovery Author' 'hostile@example.invalid' 'hostile-owner' -ExpectFailure
+    Assert-Equal $before (Get-TreeSnapshot $root) "$kind hostile recovery '$label' changed repository data before rejecting the journal."
+    foreach ($external in $externalFiles) {
+        Assert-BytesEqual $external.Bytes ([IO.File]::ReadAllBytes($external.Path)) "$kind hostile recovery '$label' changed external data at '$($external.Path)'."
+    }
+    Assert-True ($result.Output.ToLowerInvariant().Contains('transaction') -or $result.Output.ToLowerInvariant().Contains('recovery')) "$kind hostile recovery '$label' failed without a recovery-boundary diagnostic.`n$($result.Output)"
+    return $result
 }
 
 function Get-TreeSnapshotWithMetadata([string]$root) {
@@ -959,6 +1042,150 @@ function Test-CrossEngineInterruptedRecovery(
     Assert-Equal (Get-TreeSnapshot $control) (Get-TreeSnapshot $root) "$secondKind recovery of interrupted $firstKind journal was not exact."
 }
 
+function Test-HostileRecoveryRejected([ValidateSet('pwsh', 'bash')][string]$kind) {
+    $root = Join-Path $tempRoot "hostile-recovery-$kind"
+    Copy-Template $root
+    $null = Invoke-InitializerAtCrashPhase $kind $root content
+    $transactionRoot = Get-TransactionPath $kind $root
+    $manifestPath = Join-Path $transactionRoot $(if ($kind -eq 'pwsh') { 'manifest.json' } else { 'manifest' })
+    Assert-True (Test-Path -LiteralPath $transactionRoot -PathType Container) "$kind crash did not retain its transaction root for hostile-recovery tests."
+    Assert-True (Test-Path -LiteralPath $manifestPath -PathType Leaf) "$kind crash did not retain its recovery manifest."
+    $before = Get-TreeSnapshot $root
+    $originalManifest = [IO.File]::ReadAllText($manifestPath, [Text.Encoding]::UTF8)
+    $adjacentFiles = [Collections.Generic.List[string]]::new()
+
+    try {
+        $schemaVariants = [Collections.Generic.List[object]]::new()
+        if ($kind -eq 'pwsh') {
+            $manifest = $originalManifest | ConvertFrom-Json
+            $manifest.Version = 2
+            $schemaVariants.Add(@{ Name = 'wrong-version'; Text = ($manifest | ConvertTo-Json -Depth 8 -Compress) })
+            $manifest = $originalManifest | ConvertFrom-Json
+            $manifest.Engine = 'bash'
+            $schemaVariants.Add(@{ Name = 'wrong-engine'; Text = ($manifest | ConvertTo-Json -Depth 8 -Compress) })
+            $manifest = $originalManifest | ConvertFrom-Json
+            $manifest | Add-Member -NotePropertyName UnknownRecoveryField -NotePropertyValue 'hostile'
+            $schemaVariants.Add(@{ Name = 'unknown-field'; Text = ($manifest | ConvertTo-Json -Depth 8 -Compress) })
+            $schemaVariants.Add(@{ Name = 'duplicate-required-field'; Text = ('{"Version":1,' + $originalManifest.Substring(1)) })
+        }
+        else {
+            $schemaVariants.Add(@{ Name = 'wrong-version'; Text = $originalManifest.Replace("VERSION|1`n", "VERSION|2`n") })
+            $schemaVariants.Add(@{ Name = 'wrong-engine'; Text = $originalManifest.Replace("ENGINE|bash`n", "ENGINE|pwsh`n") })
+            $schemaVariants.Add(@{ Name = 'unknown-record'; Text = "$originalManifest`nUNKNOWN|hostile`n" })
+            $rootRecord = [regex]::Match($originalManifest, '(?m)^ROOT\|[^\r\n]+$').Value
+            Assert-True ([bool]$rootRecord) 'The Bash hostile fixture has no ROOT record to duplicate.'
+            $schemaVariants.Add(@{ Name = 'duplicate-required-record'; Text = "$originalManifest$rootRecord`n" })
+        }
+        foreach ($variant in $schemaVariants) {
+            Write-TestTransactionManifest $manifestPath $variant.Text
+            $null = Invoke-HostileRecoveryAttempt $kind $root $before $variant.Name
+        }
+
+        $externalRepoPath = Join-Path $tempRoot "hostile-repo-escape-$kind.txt"
+        $externalRepoBytes = [Text.Encoding]::UTF8.GetBytes("external repo escape $kind")
+        [IO.File]::WriteAllBytes($externalRepoPath, $externalRepoBytes)
+        if ($kind -eq 'pwsh') {
+            $manifest = $originalManifest | ConvertFrom-Json
+            Assert-True (@($manifest.Contents).Count -gt 0) 'The PowerShell hostile fixture has no content entry.'
+            $manifest.Contents[0].Path = $externalRepoPath
+            $mutated = $manifest | ConvertTo-Json -Depth 8 -Compress
+        }
+        else {
+            $encodedExternal = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($externalRepoPath.Replace('\', '/')))
+            $mutated = [regex]::new('(?m)^CONTENT\|[^|]+').Replace($originalManifest, "CONTENT|$encodedExternal", 1)
+            Assert-True ($mutated -cne $originalManifest) 'The Bash hostile fixture has no content entry.'
+        }
+        Write-TestTransactionManifest $manifestPath $mutated
+        $null = Invoke-HostileRecoveryAttempt $kind $root $before 'repo-path-escape' @(@{ Path = $externalRepoPath; Bytes = $externalRepoBytes })
+
+        $adjacentName = "meta-init-hostile-backup-$([guid]::NewGuid().ToString('N'))"
+        $adjacentBackup = Join-Path (Split-Path -Parent $transactionRoot) $adjacentName
+        $adjacentFiles.Add($adjacentBackup)
+        $adjacentBytes = [Text.Encoding]::UTF8.GetBytes("external dotdot backup $kind")
+        [IO.File]::WriteAllBytes($adjacentBackup, $adjacentBytes)
+        if ($kind -eq 'pwsh') {
+            $manifest = $originalManifest | ConvertFrom-Json
+            $manifest.Contents[0].Backup = $adjacentBackup
+            $mutated = $manifest | ConvertTo-Json -Depth 8 -Compress
+        }
+        else {
+            $contentLine = [regex]::Match($originalManifest, '(?m)^CONTENT\|[^\r\n]+$').Value
+            Assert-True ([bool]$contentLine) 'The Bash hostile fixture has no content record.'
+            $fields = $contentLine -split '\|'
+            $fields[2] = "../$adjacentName"
+            $mutated = $originalManifest.Replace($contentLine, ($fields -join '|'))
+        }
+        Write-TestTransactionManifest $manifestPath $mutated
+        $null = Invoke-HostileRecoveryAttempt $kind $root $before 'backup-dotdot-escape' @(@{ Path = $adjacentBackup; Bytes = $adjacentBytes })
+
+        Write-TestTransactionManifest $manifestPath $originalManifest
+        if ($IsWindows) {
+            & icacls.exe $transactionRoot '/grant' '*S-1-1-0:(OI)(CI)R' | Out-Null
+            Assert-True ($LASTEXITCODE -eq 0) 'Could not prepare the insecure Windows transaction ACL fixture.'
+        }
+        else {
+            [IO.File]::SetUnixFileMode(
+                $transactionRoot,
+                [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute -bor
+                    [IO.UnixFileMode]::GroupRead -bor [IO.UnixFileMode]::GroupExecute -bor
+                    [IO.UnixFileMode]::OtherRead -bor [IO.UnixFileMode]::OtherExecute
+            )
+        }
+        $null = Invoke-HostileRecoveryAttempt $kind $root $before 'insecure-mode-or-acl'
+        Set-TestPrivateTransactionRoot $transactionRoot
+
+        Write-TestTransactionManifest $manifestPath $originalManifest
+        if ($kind -eq 'pwsh') {
+            $manifest = $originalManifest | ConvertFrom-Json
+            $backupPath = [string]$manifest.Contents[0].Backup
+        }
+        else {
+            $contentLine = [regex]::Match($originalManifest, '(?m)^CONTENT\|[^\r\n]+$').Value
+            $backupRelative = ($contentLine -split '\|')[2]
+            $backupPath = Join-Path $transactionRoot $backupRelative
+        }
+        $externalLinkPath = Join-Path $tempRoot "hostile-linked-backup-$kind.txt"
+        $externalLinkBytes = [Text.Encoding]::UTF8.GetBytes("external linked backup $kind")
+        [IO.File]::WriteAllBytes($externalLinkPath, $externalLinkBytes)
+        $backupBytes = [IO.File]::ReadAllBytes($backupPath)
+        Remove-Item -LiteralPath $backupPath -Force
+        $null = New-Item -ItemType HardLink -Path $backupPath -Target $externalLinkPath
+        $null = Invoke-HostileRecoveryAttempt $kind $root $before 'backup-hardlink-escape' @(@{ Path = $externalLinkPath; Bytes = $externalLinkBytes })
+        Remove-Item -LiteralPath $backupPath -Force
+        [IO.File]::WriteAllBytes($backupPath, $backupBytes)
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($backupPath, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
+
+        Remove-Item -LiteralPath $manifestPath -Force
+        $null = Invoke-HostileRecoveryAttempt $kind $root $before 'ownerless-missing-manifest'
+        Write-TestTransactionManifest $manifestPath $originalManifest
+        Remove-TestTransactionRoot $transactionRoot
+        $externalDirectory = Join-Path $tempRoot "hostile-transaction-link-$kind"
+        [IO.Directory]::CreateDirectory($externalDirectory) | Out-Null
+        $externalRootSentinel = Join-Path $externalDirectory 'sentinel.txt'
+        $externalRootBytes = [Text.Encoding]::UTF8.GetBytes("external transaction root $kind")
+        [IO.File]::WriteAllBytes($externalRootSentinel, $externalRootBytes)
+        if ($IsWindows) {
+            $null = New-Item -ItemType Junction -Path $transactionRoot -Target $externalDirectory
+        }
+        else {
+            $null = New-Item -ItemType SymbolicLink -Path $transactionRoot -Target $externalDirectory
+        }
+        $null = Invoke-HostileRecoveryAttempt $kind $root $before 'linked-transaction-root' @(@{ Path = $externalRootSentinel; Bytes = $externalRootBytes })
+    }
+    finally {
+        $transactionItem = Get-Item -LiteralPath $transactionRoot -Force -ErrorAction SilentlyContinue
+        if ($null -ne $transactionItem -and
+            -not ($transactionItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -and
+            -not $transactionItem.LinkType) {
+            Set-TestPrivateTransactionRoot $transactionRoot
+        }
+        Remove-TestTransactionRoot $transactionRoot
+        foreach ($path in $adjacentFiles) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Test-LinkedBoundaryRejected([ValidateSet('pwsh', 'bash')][string]$kind) {
     $root = Join-Path $tempRoot "linked-boundary-$kind"
     Copy-Template $root
@@ -1123,6 +1350,11 @@ try {
         Write-Host 'PASS: quarantine author substitution is exact and every staged content commit is verified.' -ForegroundColor Green
         return
     }
+    if ($TestScope -eq 'hostile-recovery') {
+        foreach ($kind in @('pwsh', 'bash')) { Test-HostileRecoveryRejected $kind }
+        Write-Host 'PASS: hostile recovery roots, schemas, paths, and backup links are rejected without repository or external mutation.' -ForegroundColor Green
+        return
+    }
     if ($TestScope -eq 'cross-engine') {
         Test-CrossEngineLiveOwner pwsh bash
         Test-CrossEngineLiveOwner bash pwsh
@@ -1216,31 +1448,38 @@ try {
         Test-SettingsActivationAndRepeat $kind
         Test-ExcludedStatePreserved $kind
         Test-RenameConflictPreflight $kind
-        Test-LinkedBoundaryRejected $kind
         Test-ScriptCleanup $kind
-        Test-NestedRenameStateMachine $kind
-        foreach ($phase in @('content', 'rename', 'settings', 'cleanup', 'scripts')) {
-            Test-TransactionalFailure $kind $phase
-        }
-        $crashControl = Join-Path $tempRoot "crash-control-$kind"
-        Copy-Template $crashControl
-        $null = Invoke-Initializer $kind $crashControl 'Crash Author' 'crash@example.invalid' 'crash-owner'
-        $expectedCrashCompletion = Get-TreeSnapshot $crashControl
-        foreach ($phase in @('content', 'rename', 'settings', 'cleanup', 'scripts')) {
-            Test-CrashRecovery $kind $phase $expectedCrashCompletion
+        if ($TestScope -eq 'all') {
+            Test-LinkedBoundaryRejected $kind
+            Test-NestedRenameStateMachine $kind
+            foreach ($phase in @('content', 'rename', 'settings', 'cleanup', 'scripts')) {
+                Test-TransactionalFailure $kind $phase
+            }
+            $crashControl = Join-Path $tempRoot "crash-control-$kind"
+            Copy-Template $crashControl
+            $null = Invoke-Initializer $kind $crashControl 'Crash Author' 'crash@example.invalid' 'crash-owner'
+            $expectedCrashCompletion = Get-TreeSnapshot $crashControl
+            foreach ($phase in @('content', 'rename', 'settings', 'cleanup', 'scripts')) {
+                Test-CrashRecovery $kind $phase $expectedCrashCompletion
+            }
         }
     }
 
     Test-PowerShellMetadataPreserved
-    Test-PowerShellRollbackFailureIsRetained
-    Test-BashEnumerationAndReadFailures
-    Test-CrossEngineLiveOwner pwsh bash
-    Test-CrossEngineLiveOwner bash pwsh
-    Test-SameEngineRejectionPreservesOwnedTransaction
-    Test-CrossEngineInterruptedRecovery pwsh bash
-    Test-CrossEngineInterruptedRecovery bash pwsh
-
-    Write-Host 'PASS: metadata and settings initialization are equivalent, idempotent, crash-recoverable, link-safe, permission-preserving, transactional, failure-safe, and injection-safe.' -ForegroundColor Green
+    if ($TestScope -eq 'all') {
+        Test-PowerShellRollbackFailureIsRetained
+        foreach ($kind in @('pwsh', 'bash')) { Test-HostileRecoveryRejected $kind }
+        Test-BashEnumerationAndReadFailures
+        Test-CrossEngineLiveOwner pwsh bash
+        Test-CrossEngineLiveOwner bash pwsh
+        Test-SameEngineRejectionPreservesOwnedTransaction
+        Test-CrossEngineInterruptedRecovery pwsh bash
+        Test-CrossEngineInterruptedRecovery bash pwsh
+        Write-Host 'PASS: metadata and settings initialization are equivalent, idempotent, crash-recoverable, link-safe, permission-preserving, transactional, failure-safe, and injection-safe.' -ForegroundColor Green
+    }
+    else {
+        Write-Host 'PASS: quick metadata initialization checks are equivalent, idempotent, failure-safe, and injection-safe. Use -TestScope all for the exhaustive crash/recovery matrix.' -ForegroundColor Green
+    }
 }
 finally {
     if (Test-Path -LiteralPath $tempRoot) {

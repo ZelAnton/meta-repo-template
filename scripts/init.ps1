@@ -58,7 +58,9 @@ param(
     [Parameter(DontShow = $true)]
     [switch]$InternalRecoverOnly,
     [Parameter(DontShow = $true)]
-    [string]$InternalRecoveryParentToken
+    [string]$InternalRecoveryParentToken,
+    [Parameter(DontShow = $true)]
+    [switch]$InternalAllowEmptyTransaction
 )
 
 $ErrorActionPreference = 'Stop'
@@ -240,9 +242,9 @@ function Get-LinkCount([string]$path) {
         return 2
     }
     if ($IsWindows) {
-        $lines = @(& fsutil.exe hardlink list $path 2>$null)
-        if ($LASTEXITCODE -ne 0) { throw "Could not inspect hard-link ownership for '$path'. No files were changed." }
-        return @($lines | Where-Object { $_.ToString().Trim().Length -gt 0 }).Count
+        # PowerShell 7 reports every multiply-linked NTFS file as HardLink above.
+        # Avoid spawning fsutil for every ordinary staged/backup file.
+        return 1
     }
     $value = & stat -c '%h' -- $path 2>$null
     if ($LASTEXITCODE -ne 0) { $value = & stat -f '%l' -- $path 2>$null }
@@ -485,6 +487,369 @@ function Remove-CoordinationOwner {
     finally { $script:ownsCoordination = $false }
 }
 
+function Get-PosixStatValue([string]$path, [string]$gnuFormat, [string]$bsdFormat) {
+    $value = @(& stat -c $gnuFormat -- $path 2>$null)
+    if ($LASTEXITCODE -ne 0) { $value = @(& stat -f $bsdFormat -- $path 2>$null) }
+    if ($LASTEXITCODE -ne 0 -or $value.Count -ne 1 -or -not $value[0]) {
+        throw "Could not inspect transaction ownership for '$path'. Refusing unsafe recovery."
+    }
+    return $value[0].ToString().Trim()
+}
+
+function Assert-PrivateTransactionItem([string]$path, [switch]$Directory) {
+    $fullPath = [IO.Path]::GetFullPath($path)
+    if (-not ($pathComparer.Equals($fullPath, $transactionRoot) -or
+        $fullPath.StartsWith("$transactionRoot$([IO.Path]::DirectorySeparatorChar)", $pathComparison))) {
+        throw "Transaction path '$path' escapes '$transactionRoot'. Refusing unsafe recovery."
+    }
+    if (-not $pathComparer.Equals($fullPath, $path)) {
+        throw "Transaction path '$path' is not canonical. Refusing unsafe recovery."
+    }
+
+    $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        ($item.LinkType -and $item.LinkType -ne 'HardLink')) {
+        throw "Transaction path '$path' is a symbolic/reparse link. Refusing unsafe recovery."
+    }
+    if ($Directory -and -not $item.PSIsContainer) {
+        throw "Transaction path '$path' is not a directory. Refusing unsafe recovery."
+    }
+    if (-not $Directory -and $item.PSIsContainer) {
+        throw "Transaction path '$path' is not a regular file. Refusing unsafe recovery."
+    }
+    if (-not $Directory -and (Get-LinkCount $fullPath) -ne 1) {
+        throw "Transaction file '$path' is hard-linked and is not independently owned. Refusing unsafe recovery."
+    }
+
+    if ($IsWindows) {
+        $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $acl = Get-Acl -LiteralPath $fullPath -ErrorAction Stop
+        $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($ownerSid -ne $currentSid) {
+            throw "Transaction path '$path' is owned by another identity. Refusing unsafe recovery."
+        }
+        $foreignAllows = @($acl.Access | Where-Object {
+            if ($_.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { return $false }
+            $ruleSid = try { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { '' }
+            return $ruleSid -ne $currentSid
+        })
+        if ($foreignAllows.Count -gt 0 -or
+            ($pathComparer.Equals($fullPath, $transactionRoot) -and -not $acl.AreAccessRulesProtected)) {
+            throw "Transaction path '$path' is not private to the current identity. Refusing unsafe recovery."
+        }
+    }
+    else {
+        $currentUid = @(& id -u 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $currentUid.Count -ne 1 -or $currentUid[0] -notmatch '^\d+$') {
+            throw 'Could not establish the current POSIX identity. Refusing unsafe recovery.'
+        }
+        $ownerUid = Get-PosixStatValue $fullPath '%u' '%u'
+        if ($ownerUid -cne $currentUid[0].ToString().Trim()) {
+            throw "Transaction path '$path' is owned by another identity. Refusing unsafe recovery."
+        }
+        $expectedMode = if ($Directory) { 448 } else { 384 }
+        $actualMode = [int][IO.File]::GetUnixFileMode($fullPath)
+        if ($actualMode -ne $expectedMode) {
+            $octalMode = [Convert]::ToString($actualMode, 8)
+            throw "Transaction path '$path' has insecure mode $octalMode. Refusing unsafe recovery."
+        }
+    }
+}
+
+function Assert-PrivateTransactionTree {
+    Assert-PrivateTransactionItem $transactionRoot -Directory
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($transactionRoot)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($item in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)) {
+            if ($item.PSIsContainer -and
+                -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -and
+                -not $item.LinkType) {
+                Assert-PrivateTransactionItem $item.FullName -Directory
+                $pending.Push($item.FullName)
+            }
+            else {
+                Assert-PrivateTransactionItem $item.FullName
+            }
+        }
+    }
+}
+
+function Assert-OwnedTransactionTree {
+    Assert-PrivateTransactionItem $transactionRoot -Directory
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($transactionRoot)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($item in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.LinkType) {
+                throw "Owned transaction path '$($item.FullName)' is linked. Refusing to continue."
+            }
+            if ($item.PSIsContainer) {
+                if (-not $IsWindows) { Assert-PrivateTransactionItem $item.FullName -Directory }
+                $pending.Push($item.FullName)
+            }
+            else {
+                if (-not $IsWindows) { Assert-PrivateTransactionItem $item.FullName }
+            }
+        }
+    }
+}
+
+function Assert-TransactionReferenceFile([string]$path) {
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.LinkType) {
+        throw "Transaction reference '$path' is not an independently owned regular file."
+    }
+}
+
+function Assert-RecoveryRepoPath(
+    [string]$path,
+    [string]$purpose,
+    [ValidateSet('Any', 'File', 'Directory')][string]$ExpectedType = 'Any',
+    [switch]$SingleLinkIfPresent
+) {
+    if (-not $path) { throw "The recovery journal contains an empty $purpose path." }
+    $canonical = [IO.Path]::GetFullPath($path)
+    if (-not $pathComparer.Equals($canonical, $path)) {
+        throw "The recovery $purpose path '$path' is not canonical."
+    }
+    if (-not ($pathComparer.Equals($canonical, $repoBoundary) -or
+        $canonical.StartsWith("$repoBoundary$([IO.Path]::DirectorySeparatorChar)", $pathComparison))) {
+        throw "The recovery $purpose path '$path' escapes the repository."
+    }
+
+    $cursor = $canonical
+    while (-not $pathComparer.Equals($cursor, $repoBoundary)) {
+        $item = Get-Item -LiteralPath $cursor -Force -ErrorAction SilentlyContinue
+        if ($null -ne $item) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                ($item.LinkType -and $item.LinkType -ne 'HardLink')) {
+                throw "The recovery $purpose path '$path' uses a symbolic/reparse link."
+            }
+            if ($pathComparer.Equals($cursor, $canonical)) {
+                if ($ExpectedType -eq 'File' -and $item.PSIsContainer) {
+                    throw "The recovery $purpose path '$path' is not a regular file."
+                }
+                if ($ExpectedType -eq 'Directory' -and -not $item.PSIsContainer) {
+                    throw "The recovery $purpose path '$path' is not a directory."
+                }
+                if ($SingleLinkIfPresent -and -not $item.PSIsContainer -and (Get-LinkCount $cursor) -ne 1) {
+                    throw "The recovery $purpose path '$path' is hard-linked and is not independently owned."
+                }
+            }
+        }
+        $cursor = [IO.Path]::GetDirectoryName($cursor)
+    }
+    return $canonical
+}
+
+function Get-StrictJsonProperties(
+    [Text.Json.JsonElement]$element,
+    [string[]]$allowed,
+    [string[]]$required,
+    [string]$purpose
+) {
+    if ($element.ValueKind -ne [Text.Json.JsonValueKind]::Object) {
+        throw "The recovery journal $purpose must be an object."
+    }
+    $allowedSet = [Collections.Generic.HashSet[string]]::new($allowed, [StringComparer]::Ordinal)
+    $values = [Collections.Generic.Dictionary[string, Text.Json.JsonElement]]::new([StringComparer]::Ordinal)
+    foreach ($property in $element.EnumerateObject()) {
+        if (-not $allowedSet.Contains($property.Name)) {
+            throw "The recovery journal $purpose contains unknown field '$($property.Name)'."
+        }
+        if ($values.ContainsKey($property.Name)) {
+            throw "The recovery journal $purpose repeats field '$($property.Name)'."
+        }
+        $values.Add($property.Name, $property.Value.Clone())
+    }
+    foreach ($name in $required) {
+        if (-not $values.ContainsKey($name)) {
+            throw "The recovery journal $purpose lacks field '$name'."
+        }
+    }
+    return $values
+}
+
+function Get-StrictJsonString([Text.Json.JsonElement]$element, [string]$purpose) {
+    if ($element.ValueKind -ne [Text.Json.JsonValueKind]::String) {
+        throw "The recovery journal $purpose must be a string."
+    }
+    return $element.GetString()
+}
+
+function Get-StrictJsonInt([Text.Json.JsonElement]$element, [string]$purpose) {
+    if ($element.ValueKind -ne [Text.Json.JsonValueKind]::Number) {
+        throw "The recovery journal $purpose must be an integer."
+    }
+    try { return $element.GetInt32() }
+    catch { throw "The recovery journal $purpose is not a supported integer." }
+}
+
+function ConvertFrom-StrictTransactionMetadata([Text.Json.JsonElement]$element, [string]$purpose) {
+    $values = Get-StrictJsonProperties $element @('Attributes', 'UnixMode', 'Sddl') @('Attributes', 'UnixMode', 'Sddl') $purpose
+    $attributes = Get-StrictJsonInt $values.Attributes "$purpose.Attributes"
+    $unixMode = $null
+    $sddl = $null
+    if ($IsWindows) {
+        if ($values.UnixMode.ValueKind -ne [Text.Json.JsonValueKind]::Null) {
+            throw "The recovery journal $purpose.UnixMode must be null on Windows."
+        }
+        $sddl = Get-StrictJsonString $values.Sddl "$purpose.Sddl"
+        if (-not $sddl) { throw "The recovery journal $purpose.Sddl is empty." }
+    }
+    else {
+        if ($values.Sddl.ValueKind -ne [Text.Json.JsonValueKind]::Null) {
+            throw "The recovery journal $purpose.Sddl must be null on POSIX."
+        }
+        $unixMode = Get-StrictJsonInt $values.UnixMode "$purpose.UnixMode"
+        if ($unixMode -lt 0 -or $unixMode -gt 4095) {
+            throw "The recovery journal $purpose.UnixMode is outside the supported permission range."
+        }
+    }
+    return [pscustomobject]@{ Attributes = $attributes; UnixMode = $unixMode; Sddl = $sddl }
+}
+
+function ConvertFrom-StrictTransactionManifest([string]$json) {
+    try { $document = [Text.Json.JsonDocument]::Parse($json) }
+    catch { throw "The transaction manifest is not valid JSON. Refusing unsafe recovery. $($_.Exception.Message)" }
+    try {
+        $topNames = @(
+            'Version', 'Engine', 'RepoRoot', 'State', 'Contents', 'Renames', 'Settings',
+            'Cleanup', 'EnsureDocsDirectory', 'DeferredCleanup'
+        )
+        $top = Get-StrictJsonProperties $document.RootElement $topNames $topNames 'root'
+        if ((Get-StrictJsonInt $top.Version 'Version') -ne 1) {
+            throw 'The recovery journal has an unsupported Version.'
+        }
+        if ((Get-StrictJsonString $top.Engine 'Engine') -cne 'pwsh') {
+            throw 'The recovery journal has the wrong Engine.'
+        }
+        $journalRepo = Get-StrictJsonString $top.RepoRoot 'RepoRoot'
+        if (-not $pathComparer.Equals($journalRepo, $repoBoundary)) {
+            throw "Recovery journal '$transactionRoot' belongs to a different repository."
+        }
+        $state = Get-StrictJsonString $top.State 'State'
+        if ($state -notin @('prepared', 'committed')) {
+            throw "The recovery journal has unsupported State '$state'."
+        }
+
+        foreach ($arrayName in @('Contents', 'Renames', 'Cleanup', 'DeferredCleanup')) {
+            if ($top[$arrayName].ValueKind -ne [Text.Json.JsonValueKind]::Array) {
+                throw "The recovery journal $arrayName must be an array."
+            }
+            if ($top[$arrayName].GetArrayLength() -gt 100000) {
+                throw "The recovery journal $arrayName exceeds the supported cardinality."
+            }
+        }
+
+        $transactionPaths = [Collections.Generic.HashSet[string]]::new($pathComparer)
+        $contentPaths = [Collections.Generic.HashSet[string]]::new($pathComparer)
+        $contents = [Collections.Generic.List[object]]::new()
+        $index = 0
+        foreach ($element in $top.Contents.EnumerateArray()) {
+            $entry = Get-StrictJsonProperties $element @('Path', 'Backup', 'Stage', 'Metadata') @('Path', 'Backup', 'Stage', 'Metadata') "Contents[$index]"
+            $path = Assert-RecoveryRepoPath (Get-StrictJsonString $entry.Path "Contents[$index].Path") 'content' File -SingleLinkIfPresent
+            if (-not $contentPaths.Add($path)) { throw "The recovery journal repeats content path '$path'." }
+            $backup = Get-StrictJsonString $entry.Backup "Contents[$index].Backup"
+            $stage = Get-StrictJsonString $entry.Stage "Contents[$index].Stage"
+            $expectedBackup = Join-Path (Join-Path $transactionRoot 'content-backup') ($index.ToString('D8'))
+            $expectedStage = Join-Path (Join-Path $transactionRoot 'content-stage') ($index.ToString('D8'))
+            if (-not $pathComparer.Equals($backup, $expectedBackup) -or -not $pathComparer.Equals($stage, $expectedStage)) {
+                throw "The recovery journal Contents[$index] backup/stage layout is invalid."
+            }
+            if (-not $transactionPaths.Add($backup) -or -not $transactionPaths.Add($stage)) {
+                throw "The recovery journal repeats a transaction file reference."
+            }
+            Assert-TransactionReferenceFile $backup
+            Assert-TransactionReferenceFile $stage
+            $metadata = ConvertFrom-StrictTransactionMetadata $entry.Metadata "Contents[$index].Metadata"
+            $contents.Add([pscustomobject]@{ Path = $path; Backup = $backup; Stage = $stage; Metadata = $metadata })
+            $index++
+        }
+
+        $renamePaths = [Collections.Generic.HashSet[string]]::new($pathComparer)
+        $renames = [Collections.Generic.List[object]]::new()
+        $index = 0
+        foreach ($element in $top.Renames.EnumerateArray()) {
+            $entry = Get-StrictJsonProperties $element @('Source', 'Destination', 'OldName', 'NewName') @('Source', 'Destination', 'OldName', 'NewName') "Renames[$index]"
+            $source = Assert-RecoveryRepoPath (Get-StrictJsonString $entry.Source "Renames[$index].Source") 'rename source'
+            $destination = Assert-RecoveryRepoPath (Get-StrictJsonString $entry.Destination "Renames[$index].Destination") 'rename destination'
+            $oldName = Get-StrictJsonString $entry.OldName "Renames[$index].OldName"
+            $newName = Get-StrictJsonString $entry.NewName "Renames[$index].NewName"
+            if ($oldName -cne [IO.Path]::GetFileName($source) -or $newName -cne [IO.Path]::GetFileName($destination)) {
+                throw "The recovery journal Renames[$index] names do not match their paths."
+            }
+            if (-not $renamePaths.Add($source) -or -not $renamePaths.Add($destination)) {
+                throw "The recovery journal repeats a rename endpoint."
+            }
+            $renames.Add([pscustomobject]@{ Source = $source; Destination = $destination; OldName = $oldName; NewName = $newName })
+            $index++
+        }
+
+        $settings = $null
+        if ($top.Settings.ValueKind -ne [Text.Json.JsonValueKind]::Null) {
+            $entry = Get-StrictJsonProperties $top.Settings @('Template', 'Destination', 'Backup', 'Metadata') @('Template', 'Destination', 'Backup', 'Metadata') 'Settings'
+            $template = Assert-RecoveryRepoPath (Get-StrictJsonString $entry.Template 'Settings.Template') 'settings template' File
+            $destination = Assert-RecoveryRepoPath (Get-StrictJsonString $entry.Destination 'Settings.Destination') 'settings destination' File
+            $backup = Get-StrictJsonString $entry.Backup 'Settings.Backup'
+            $expectedBackup = Join-Path $transactionRoot 'settings-template'
+            if (-not $pathComparer.Equals($backup, $expectedBackup) -or -not $transactionPaths.Add($backup)) {
+                throw 'The recovery journal Settings backup layout is invalid.'
+            }
+            Assert-TransactionReferenceFile $backup
+            $metadata = ConvertFrom-StrictTransactionMetadata $entry.Metadata 'Settings.Metadata'
+            $settings = [pscustomobject]@{ Template = $template; Destination = $destination; Backup = $backup; Metadata = $metadata }
+        }
+
+        $cleanupPaths = [Collections.Generic.HashSet[string]]::new($pathComparer)
+        $cleanup = [Collections.Generic.List[object]]::new()
+        $index = 0
+        foreach ($element in $top.Cleanup.EnumerateArray()) {
+            $entry = Get-StrictJsonProperties $element @('Path', 'Backup', 'Metadata') @('Path', 'Backup', 'Metadata') "Cleanup[$index]"
+            $path = Assert-RecoveryRepoPath (Get-StrictJsonString $entry.Path "Cleanup[$index].Path") 'cleanup' File -SingleLinkIfPresent
+            if (-not $cleanupPaths.Add($path)) { throw "The recovery journal repeats cleanup path '$path'." }
+            $backup = Get-StrictJsonString $entry.Backup "Cleanup[$index].Backup"
+            $expectedBackup = Join-Path (Join-Path $transactionRoot 'cleanup-backup') ($index.ToString('D8'))
+            if (-not $pathComparer.Equals($backup, $expectedBackup) -or -not $transactionPaths.Add($backup)) {
+                throw "The recovery journal Cleanup[$index] backup layout is invalid."
+            }
+            Assert-TransactionReferenceFile $backup
+            $metadata = ConvertFrom-StrictTransactionMetadata $entry.Metadata "Cleanup[$index].Metadata"
+            $cleanup.Add([pscustomobject]@{ Path = $path; Backup = $backup; Metadata = $metadata })
+            $index++
+        }
+
+        $docs = $null
+        if ($top.EnsureDocsDirectory.ValueKind -ne [Text.Json.JsonValueKind]::Null) {
+            $docs = Assert-RecoveryRepoPath (Get-StrictJsonString $top.EnsureDocsDirectory 'EnsureDocsDirectory') 'docs directory' Directory
+            if (-not $pathComparer.Equals($docs, (Join-Path $repoBoundary 'docs'))) {
+                throw 'The recovery journal EnsureDocsDirectory path is not the initializer docs directory.'
+            }
+        }
+
+        $deferredSet = [Collections.Generic.HashSet[string]]::new($pathComparer)
+        $deferred = [Collections.Generic.List[string]]::new()
+        $index = 0
+        foreach ($element in $top.DeferredCleanup.EnumerateArray()) {
+            $path = Assert-RecoveryRepoPath (Get-StrictJsonString $element "DeferredCleanup[$index]") 'deferred cleanup' File -SingleLinkIfPresent
+            if (-not $deferredSet.Add($path)) { throw "The recovery journal repeats deferred cleanup path '$path'." }
+            if (-not $cleanupPaths.Contains($path)) { throw "Deferred cleanup path '$path' has no cleanup backup entry." }
+            $deferred.Add($path)
+            $index++
+        }
+
+        return [pscustomobject][ordered]@{
+            Version = 1; Engine = 'pwsh'; RepoRoot = $repoBoundary; State = $state
+            Contents = @($contents); Renames = @($renames); Settings = $settings
+            Cleanup = @($cleanup); EnsureDocsDirectory = $docs; DeferredCleanup = @($deferred)
+        }
+    }
+    finally { $document.Dispose() }
+}
+
 function Restore-Transaction([object]$manifest) {
     $errors = [Collections.Generic.List[string]]::new()
     if ([string]$manifest.RepoRoot -cne $repoBoundary) {
@@ -493,6 +858,7 @@ function Restore-Transaction([object]$manifest) {
     if ([string]$manifest.State -eq 'committed') {
         foreach ($path in @($manifest.DeferredCleanup)) {
             try {
+                Assert-RecoveryRepoPath ([string]$path) 'deferred cleanup' File -SingleLinkIfPresent | Out-Null
                 if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction Stop }
             }
             catch { $errors.Add("deferred cleanup '$path': $($_.Exception.Message)") }
@@ -501,6 +867,7 @@ function Restore-Transaction([object]$manifest) {
     elseif ([string]$manifest.State -eq 'prepared') {
         foreach ($entry in @($manifest.Cleanup)) {
             try {
+                Assert-RecoveryRepoPath ([string]$entry.Path) 'cleanup' File -SingleLinkIfPresent | Out-Null
                 [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName([string]$entry.Path)) | Out-Null
                 [IO.File]::WriteAllBytes([string]$entry.Path, [IO.File]::ReadAllBytes([string]$entry.Backup))
                 Set-FileMetadata ([string]$entry.Path) $entry.Metadata
@@ -508,12 +875,17 @@ function Restore-Transaction([object]$manifest) {
             catch { $errors.Add("cleanup restore '$($entry.Path)': $($_.Exception.Message)") }
         }
         if ($manifest.EnsureDocsDirectory) {
-            try { [IO.Directory]::CreateDirectory([string]$manifest.EnsureDocsDirectory) | Out-Null }
+            try {
+                Assert-RecoveryRepoPath ([string]$manifest.EnsureDocsDirectory) 'docs directory' Directory | Out-Null
+                [IO.Directory]::CreateDirectory([string]$manifest.EnsureDocsDirectory) | Out-Null
+            }
             catch { $errors.Add("docs restore: $($_.Exception.Message)") }
         }
         if ($null -ne $manifest.Settings) {
             $entry = $manifest.Settings
             try {
+                Assert-RecoveryRepoPath ([string]$entry.Template) 'settings template' File -SingleLinkIfPresent | Out-Null
+                Assert-RecoveryRepoPath ([string]$entry.Destination) 'settings destination' File -SingleLinkIfPresent | Out-Null
                 if (Test-Path -LiteralPath ([string]$entry.Destination)) {
                     if (-not (Test-FileBytesEqual ([string]$entry.Destination) ([string]$entry.Backup))) {
                         throw 'the destination does not match the transaction copy'
@@ -535,6 +907,8 @@ function Restore-Transaction([object]$manifest) {
         for ($index = $renames.Count - 1; $index -ge 0; $index--) {
             $entry = $renames[$index]
             try {
+                Assert-RecoveryRepoPath ([string]$entry.Source) 'rename source' | Out-Null
+                Assert-RecoveryRepoPath ([string]$entry.Destination) 'rename destination' | Out-Null
                 $sourceExists = Test-Path -LiteralPath ([string]$entry.Source)
                 $destinationExists = Test-Path -LiteralPath ([string]$entry.Destination)
                 if ($sourceExists -and $destinationExists) { throw 'both source and destination exist' }
@@ -547,6 +921,7 @@ function Restore-Transaction([object]$manifest) {
         }
         foreach ($entry in @($manifest.Contents)) {
             try {
+                Assert-RecoveryRepoPath ([string]$entry.Path) 'content' File -SingleLinkIfPresent | Out-Null
                 [IO.File]::WriteAllBytes([string]$entry.Path, [IO.File]::ReadAllBytes([string]$entry.Backup))
                 Set-FileMetadata ([string]$entry.Path) $entry.Metadata
             }
@@ -577,11 +952,12 @@ function Restore-Transaction([object]$manifest) {
     if ($errors.Count -gt 0) {
         throw "Automatic recovery was incomplete. Private backups remain at '$transactionRoot'. $($errors -join ' | ')"
     }
+    Assert-PrivateTransactionItem $transactionRoot -Directory
     Remove-Item -LiteralPath $transactionRoot -Recurse -Force -ErrorAction Stop
     Write-Host '    Recovered an interrupted initialization transaction.' -ForegroundColor Yellow
 }
 
-function Invoke-BashRecoveryOnly {
+function Invoke-BashRecoveryOnly([switch]$AllowEmptyTransaction) {
     if (-not (Test-Path -LiteralPath $siblingShPath -PathType Leaf)) {
         throw 'The Bash initializer required for cross-engine recovery is unavailable.'
     }
@@ -605,6 +981,7 @@ function Invoke-BashRecoveryOnly {
                 './scripts/init.sh', '--project-name', $ProjectName, '--keep-script',
                 '--internal-recover-only', '--internal-recovery-parent-token', $coordinationToken
             )
+            if ($AllowEmptyTransaction) { $arguments += '--internal-allow-empty-transaction' }
             $bashRecords = @(& bash @arguments 2>&1)
             $bashExitCode = $LASTEXITCODE
             if ($bashExitCode -ne 0) {
@@ -620,14 +997,21 @@ function Invoke-BashRecoveryOnly {
     }
 }
 
-function Invoke-NativeRecovery {
-    if (Test-Path -LiteralPath $transactionRoot) {
-        if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
-            $existingManifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
-            Restore-Transaction $existingManifest
+function Invoke-NativeRecovery([switch]$AllowEmptyTransaction) {
+    $existingRoot = Get-Item -LiteralPath $transactionRoot -Force -ErrorAction SilentlyContinue
+    if ($null -eq $existingRoot) { return }
+    Assert-PrivateTransactionTree
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        if ($AllowEmptyTransaction) {
+            Remove-Item -LiteralPath $transactionRoot -Recurse -Force -ErrorAction Stop
+            Write-Host '    Recovered an interrupted preflight transaction.' -ForegroundColor Yellow
+            return
         }
-        else { Remove-Item -LiteralPath $transactionRoot -Recurse -Force -ErrorAction Stop }
+        throw "Transaction root '$transactionRoot' has no regular manifest. Refusing unsafe recovery."
     }
+    $manifestText = [IO.File]::ReadAllText($manifestPath, [Text.Encoding]::UTF8)
+    $existingManifest = ConvertFrom-StrictTransactionManifest $manifestText
+    Restore-Transaction $existingManifest
 }
 
 function Enter-CoordinationAndRecover {
@@ -646,7 +1030,8 @@ function Enter-CoordinationAndRecover {
     if ($null -ne $existingOwner -and (Test-CoordinationOwnerAlive $existingOwner)) {
         throw 'Another initializer process owns the active repository transaction. No files were changed.'
     }
-    $needsRecovery = $null -ne $existingOwner -or (Test-Path -LiteralPath $transactionRoot)
+    $needsRecovery = $null -ne $existingOwner -or
+        $null -ne (Get-Item -LiteralPath $transactionRoot -Force -ErrorAction SilentlyContinue)
     if (-not $needsRecovery) {
         New-CoordinationOwner
         return
@@ -672,9 +1057,9 @@ function Enter-CoordinationAndRecover {
 
         New-CoordinationOwner
         if ($null -ne $existingOwner -and $existingOwner.Engine -eq 'bash') {
-            Invoke-BashRecoveryOnly
+            Invoke-BashRecoveryOnly -AllowEmptyTransaction
         }
-        Invoke-NativeRecovery
+        Invoke-NativeRecovery -AllowEmptyTransaction:($null -ne $existingOwner -and $existingOwner.Engine -eq 'pwsh')
     }
     finally { Remove-RecoveryClaim }
 }
@@ -690,7 +1075,7 @@ if ($recoveryOnly) {
         -not (Test-CoordinationOwnerAlive $parentOwner)) {
         throw 'Recovery-only mode could not validate the active parent coordination owner.'
     }
-    Invoke-NativeRecovery
+    Invoke-NativeRecovery -AllowEmptyTransaction:$InternalAllowEmptyTransaction
     return
 }
 
@@ -871,8 +1256,13 @@ $scriptCleanup = @($cleanupPlan | Where-Object { $_ -eq $siblingShPath })
 $transactionalCleanup = @($cleanupPlan)
 $manifest = $null
 
-    Set-PrivateTransactionDirectory $transactionRoot
+    if ($null -ne (Get-Item -LiteralPath $transactionRoot -Force -ErrorAction SilentlyContinue)) {
+        throw "Transaction root '$transactionRoot' appeared after recovery. No source files were changed."
+    }
+    New-Item -ItemType Directory -Path $transactionRoot -ErrorAction Stop | Out-Null
     $ownsTransaction = $true
+    Set-PrivateTransactionDirectory $transactionRoot
+    Assert-PrivateTransactionItem $transactionRoot -Directory
     $contentBackupDir = Join-Path $transactionRoot 'content-backup'
     $contentStageDir = Join-Path $transactionRoot 'content-stage'
     $cleanupBackupDir = Join-Path $transactionRoot 'cleanup-backup'
@@ -933,6 +1323,7 @@ $manifest = $null
         DeferredCleanup = @($deferredCleanup)
     }
     Write-DurableText $manifestPath ($manifest | ConvertTo-Json -Depth 8 -Compress)
+    Assert-OwnedTransactionTree
 
     Write-Host "==> Initializing template as '$ProjectName'" -ForegroundColor Cyan
     $transactionActive = $true
