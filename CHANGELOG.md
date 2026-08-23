@@ -16,6 +16,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 -
 
 ### Fixed
--
+- Prevent template initialization from rewriting binary or non-UTF-8 files, while preserving UTF-8 BOMs and line endings during token substitution.
 
 [Unreleased]: https://github.com/__GitHubOwner__/__ProjectName__/commits/main

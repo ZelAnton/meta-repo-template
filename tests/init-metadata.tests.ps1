@@ -773,6 +773,36 @@ function Test-ExcludedStatePreserved([ValidateSet('pwsh', 'bash')][string]$kind)
     Assert-Equal 'project=Acme.Metadata; author=Preservation Author' ([IO.File]::ReadAllText($ordinaryResult)) "$kind did not substitute ordinary project content."
 }
 
+function Test-ContentEncodingSafety([ValidateSet('pwsh', 'bash')][string]$kind) {
+    $root = Join-Path $tempRoot "content-encoding-$kind"
+    Copy-Template $root
+
+    $binaryPath = Join-Path $root 'fixtures/token-payload.bin'
+    $utf16Path = Join-Path $root 'fixtures/token-payload.utf16'
+    $utf8Path = Join-Path $root 'fixtures/utf8-bom-crlf.txt'
+    $stablePath = Join-Path $root 'fixtures/utf8-no-token.txt'
+    [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($binaryPath)) | Out-Null
+
+    $binaryBytes = [byte[]](0x13, 0x00, 0xFF, 0x5F, 0x5F, 0x50, 0x72, 0x6F, 0x6A, 0x65, 0x63, 0x74, 0x4E, 0x61, 0x6D, 0x65, 0x5F, 0x5F, 0x7E)
+    $utf16Encoding = [Text.UnicodeEncoding]::new($false, $true)
+    $utf16Bytes = [byte[]]($utf16Encoding.GetPreamble() + $utf16Encoding.GetBytes('project=__ProjectName__'))
+    $utf8BomEncoding = [Text.UTF8Encoding]::new($true)
+    $utf8Bytes = [byte[]]($utf8BomEncoding.GetPreamble() + $utf8BomEncoding.GetBytes("project=__ProjectName__`r`nauthor=__Author__`r`n"))
+    $stableBytes = [byte[]]($utf8BomEncoding.GetPreamble() + $utf8BomEncoding.GetBytes("stable content`r`nwithout tokens`r`n"))
+    [IO.File]::WriteAllBytes($binaryPath, $binaryBytes)
+    [IO.File]::WriteAllBytes($utf16Path, $utf16Bytes)
+    [IO.File]::WriteAllBytes($utf8Path, $utf8Bytes)
+    [IO.File]::WriteAllBytes($stablePath, $stableBytes)
+
+    $null = Invoke-Initializer $kind $root 'Safety Author' 'safety@example.invalid' 'safety-owner'
+
+    Assert-BytesEqual $binaryBytes ([IO.File]::ReadAllBytes($binaryPath)) "$kind rewrote a binary file containing a token-like byte sequence."
+    Assert-BytesEqual $utf16Bytes ([IO.File]::ReadAllBytes($utf16Path)) "$kind rewrote a UTF-16 file containing a token."
+    $expectedUtf8 = [byte[]]($utf8BomEncoding.GetPreamble() + $utf8BomEncoding.GetBytes("project=Acme.Metadata`r`nauthor=Safety Author`r`n"))
+    Assert-BytesEqual $expectedUtf8 ([IO.File]::ReadAllBytes($utf8Path)) "$kind did not preserve UTF-8 BOM and CRLF bytes during substitution."
+    Assert-BytesEqual $stableBytes ([IO.File]::ReadAllBytes($stablePath)) "$kind rewrote a UTF-8 file without a replacement."
+}
+
 function Test-TransactionalFailure(
     [ValidateSet('pwsh', 'bash')][string]$kind,
     [ValidateSet('content', 'rename', 'settings', 'cleanup', 'scripts')][string]$phase
@@ -1447,6 +1477,7 @@ try {
         Test-ExistingSettingsPreserved $kind
         Test-SettingsActivationAndRepeat $kind
         Test-ExcludedStatePreserved $kind
+        Test-ContentEncodingSafety $kind
         Test-RenameConflictPreflight $kind
         Test-ScriptCleanup $kind
         if ($TestScope -eq 'all') {

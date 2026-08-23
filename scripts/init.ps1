@@ -102,6 +102,43 @@ $pathComparer = if ($IsWindows) { [StringComparer]::OrdinalIgnoreCase } else { [
 $pathComparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
 $repoBoundary = [IO.Path]::GetFullPath($repoRoot).TrimEnd('\', '/')
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
+$utf8Strict = [Text.UTF8Encoding]::new($false, $true)
+
+function Read-SupportedUtf8Text([string]$path) {
+    $bytes = [IO.File]::ReadAllBytes($path)
+    if ($bytes.Length -eq 0) { return [pscustomobject]@{ Text = ''; HasBom = $false } }
+
+    # UTF-16/32 and arbitrary binary data must never be decoded through the
+    # replacement-character fallback. NUL is not part of the supported text
+    # contract, even though it is technically valid UTF-8.
+    if ($bytes -contains [byte]0) { return $null }
+    if ($bytes.Length -ge 2 -and
+        (($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) -or
+         ($bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF))) { return $null }
+
+    $offset = 0
+    $hasBom = $false
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        $offset = 3
+        $hasBom = $true
+    }
+    try {
+        $text = $utf8Strict.GetString($bytes, $offset, $bytes.Length - $offset)
+    }
+    catch [Text.DecoderFallbackException] {
+        return $null
+    }
+    return [pscustomobject]@{ Text = $text; HasBom = $hasBom }
+}
+
+function Encode-SupportedUtf8Text([string]$text, [bool]$hasBom) {
+    $encoded = $utf8Strict.GetBytes($text)
+    if (-not $hasBom) { return $encoded }
+    $withBom = [byte[]]::new($encoded.Length + 3)
+    [Array]::Copy([byte[]](0xEF, 0xBB, 0xBF), 0, $withBom, 0, 3)
+    [Array]::Copy($encoded, 0, $withBom, 3, $encoded.Length)
+    return $withBom
+}
 
 function Get-CoordinationRepoIdentity([string]$path) {
     $identity = [IO.Path]::GetFullPath($path).TrimEnd('\', '/').Replace('\', '/')
@@ -1190,7 +1227,9 @@ $files = $allEntries | Where-Object {
 }
 foreach ($file in $files) {
     if ($binaryExtensions -contains $file.Extension) { continue }
-    $text = [IO.File]::ReadAllText($file.FullName)
+    $decoded = Read-SupportedUtf8Text $file.FullName
+    if ($null -eq $decoded) { continue }
+    $text = $decoded.Text
     $map = if ($xmlFileExtensions -contains $file.Extension) { $xmlReplacements } else { $replacements }
     # A single pass prevents a replacement value that resembles another token from
     # being interpreted as template syntax.
@@ -1198,7 +1237,7 @@ foreach ($file in $files) {
     if ($new -cne $text) {
         $contentPlan.Add([pscustomobject]@{
             Path = $file.FullName
-            Content = $new
+            Bytes = Encode-SupportedUtf8Text $new $decoded.HasBom
             Metadata = Get-FileMetadata $file.FullName
         })
     }
@@ -1275,7 +1314,7 @@ $manifest = $null
         $backup = Join-Path $contentBackupDir $name
         $stage = Join-Path $contentStageDir $name
         Copy-PrivateFile $entry.Path $backup
-        [IO.File]::WriteAllText($stage, $entry.Content, $utf8NoBom)
+        [IO.File]::WriteAllBytes($stage, [byte[]]$entry.Bytes)
         if (-not $IsWindows) {
             [IO.File]::SetUnixFileMode($stage, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
         }

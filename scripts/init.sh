@@ -82,6 +82,11 @@ claude_settings="$repo_root/.claude/settings.json"
 claude_template="$repo_root/.claude/settings.json.template"
 has_existing_claude_settings=0
 
+# Fail closed if strict UTF-8 validation is unavailable; silently skipping all
+# content would otherwise produce a partially initialized project.
+utf8_validator="$(command -v iconv 2>/dev/null || true)"
+[ -n "$utf8_validator" ] || die "iconv is required for strict UTF-8 validation. Install iconv and rerun."
+
 failure_phase="${META_INIT_TEST_FAIL_PHASE:-}"
 case "$failure_phase" in
   ""|content|rename|settings|cleanup|scripts) ;;
@@ -120,31 +125,49 @@ author_b64=""; author_email_b64=""
 
 token_pattern='(__ProjectName__|__AuthorEmailBase64__|__AuthorBase64__|__AuthorEmail__|__Author__|__GitHubOwner__|__Description__|__Year__)'
 
-replace_tokens() {
-  local content="$1"
-  local mode="$2"
-  local rest="$content"
-  local output=""
-  local token prefix replacement
+is_supported_utf8_file() {
+  local file="$1"
+  # iconv is used only as a strict validator; the original bytes are fed to the
+  # replacement pass so BOMs, line endings, and all non-token bytes are retained.
+  "$utf8_validator" -f UTF-8 -t UTF-8 < "$file" >/dev/null 2>&1 || return 1
+  # NUL is technically valid UTF-8 but is a binary marker for this initializer.
+  LC_ALL=C tr -d '\000' < "$file" | cmp -s - "$file" || return 1
+  return 0
+}
 
-  while [[ "$rest" =~ $token_pattern ]]; do
-    token="${BASH_REMATCH[1]}"
-    prefix="${rest%%"$token"*}"
-    output+="$prefix"
-    case "$token" in
-      __ProjectName__)       if [ "$mode" = xml ]; then replacement="$project_x"; else replacement="$project_name"; fi ;;
-      __Author__)            if [ "$mode" = xml ]; then replacement="$author_x"; else replacement="$author"; fi ;;
-      __AuthorEmail__)       if [ "$mode" = xml ]; then replacement="$author_email_x"; else replacement="$author_email"; fi ;;
-      __AuthorBase64__)      replacement="$author_b64" ;;
-      __AuthorEmailBase64__) replacement="$author_email_b64" ;;
-      __GitHubOwner__)       if [ "$mode" = xml ]; then replacement="$owner_x"; else replacement="$github_owner"; fi ;;
-      __Description__)       if [ "$mode" = xml ]; then replacement="$desc_x"; else replacement="$description"; fi ;;
-      __Year__)              if [ "$mode" = xml ]; then replacement="$year_x"; else replacement="$year"; fi ;;
-    esac
-    output+="$replacement"
-    rest="${rest#*"$token"}"
-  done
-  printf '%s%s' "$output" "$rest"
+replace_tokens_file() {
+  local source="$1" destination="$2" mode="$3"
+  META_INIT_PROJECT="$project_name" \
+  META_INIT_AUTHOR="$author" \
+  META_INIT_AUTHOR_EMAIL="$author_email" \
+  META_INIT_AUTHOR_B64="$author_b64" \
+  META_INIT_AUTHOR_EMAIL_B64="$author_email_b64" \
+  META_INIT_OWNER="$github_owner" \
+  META_INIT_DESCRIPTION="$description" \
+  META_INIT_YEAR="$year" \
+  META_INIT_XML_MODE="$mode" \
+    perl -0pe '
+      BEGIN {
+        %replacement = (
+          "__ProjectName__"       => $ENV{META_INIT_PROJECT},
+          "__Author__"            => $ENV{META_INIT_AUTHOR},
+          "__AuthorEmail__"       => $ENV{META_INIT_AUTHOR_EMAIL},
+          "__AuthorBase64__"      => $ENV{META_INIT_AUTHOR_B64},
+          "__AuthorEmailBase64__" => $ENV{META_INIT_AUTHOR_EMAIL_B64},
+          "__GitHubOwner__"        => $ENV{META_INIT_OWNER},
+          "__Description__"        => $ENV{META_INIT_DESCRIPTION},
+          "__Year__"              => $ENV{META_INIT_YEAR},
+        );
+        if (($ENV{META_INIT_XML_MODE} // "") eq "xml") {
+          for my $key (keys %replacement) {
+            $replacement{$key} =~ s/&/&amp;/g;
+            $replacement{$key} =~ s/</&lt;/g;
+            $replacement{$key} =~ s/>/&gt;/g;
+          }
+        }
+      }
+      s/(__ProjectName__|__AuthorEmailBase64__|__AuthorBase64__|__AuthorEmail__|__Author__|__GitHubOwner__|__Description__|__Year__)/$replacement{$1}/g;
+    ' "$source" > "$destination"
 }
 
 encode_path() { printf '%s' "$1" | base64 | tr -d '\r\n'; }
@@ -1167,32 +1190,33 @@ for file in "${content_candidates[@]}"; do
     "$self"|"$sibling_ps1"|"$claude_settings") continue ;;
     *.snk|*.pfx|*.png|*.jpg|*.jpeg|*.gif|*.ico|*.zip|*.jar) continue ;;
   esac
-  if content="$(cat -- "$file"; read_status=$?; printf x; exit "$read_status")"; then
-    content="${content%x}"
-  else
-    die "could not read '$file'. No files were changed."
-  fi
-  orig="$content"
+  is_supported_utf8_file "$file" || continue
+  LC_ALL=C grep -Eq "$token_pattern" -- "$file" || continue
   case "$file" in
     *.csproj|*.fsproj|*.props|*.targets|*.slnx|*.config) mode=xml ;;
     *) mode=raw ;;
   esac
-  content="$(replace_tokens "$content" "$mode"; printf x)"; content="${content%x}"
-  if [ "$content" != "$orig" ]; then
-    index="${#content_files[@]}"
-    backup="$transaction_root/content-backup/$index"
-    staged="$transaction_root/content-stage/$index"
-    original_mode="$(stat_mode "$file")" || die "could not read permissions for '$file'. No files were changed."
-    cp -p -- "$file" "$backup"
-    cp -p -- "$file" "$staged"
-    printf '%s' "$content" > "$staged"
-    chmod 600 "$backup" "$staged"
-    content_files+=("$file")
-    content_backups+=("$backup")
-    content_staged+=("$staged")
-    content_modes+=("$original_mode")
-    changed=$((changed + 1))
+  candidate="$transaction_root/content-stage/.candidate"
+  replace_tokens_file "$file" "$candidate" "$mode" ||
+    die "could not safely rewrite '$file'. No files were changed."
+  if cmp -s -- "$candidate" "$file"; then
+    rm -f -- "$candidate"
+    continue
   fi
+  index="${#content_files[@]}"
+  backup="$transaction_root/content-backup/$index"
+  staged="$transaction_root/content-stage/$index"
+  original_mode="$(stat_mode "$file")" || die "could not read permissions for '$file'. No files were changed."
+  cp -p -- "$file" "$backup"
+  cp -p -- "$file" "$staged"
+  cat -- "$candidate" > "$staged"
+  rm -f -- "$candidate"
+  chmod 600 "$backup" "$staged"
+  content_files+=("$file")
+  content_backups+=("$backup")
+  content_staged+=("$staged")
+  content_modes+=("$original_mode")
+  changed=$((changed + 1))
 done
 
 cleanup_modes=()
