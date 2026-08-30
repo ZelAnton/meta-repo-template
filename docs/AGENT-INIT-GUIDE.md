@@ -51,12 +51,12 @@ Confirm these facts by reading, not by assuming:
 - Stack and conventions (all enforced — see `AGENTS.md`):
   <!-- META(%%): list the load-bearing, surprising-to-an-agent facts for %%LangName%%:
        language/runtime version, test framework, warnings-as-errors, formatter,
-       cross-project reference rules, indentation, and the VCS (jj). Example (.NET):
+       cross-project reference rules, indentation, and the VCS. Example (.NET):
        net10, NUnit, TreatWarningsAsErrors, .slnx + BuildDependency,
        Reference + AssemblySearchPaths, Central Package Management, tabs. -->
   - %%LangName%% %%LangVersion%%; build/test with `%%BuildCmd%%` / `%%TestCmd%%`.
   - Formatter: `%%FmtCmd%%`. Warnings are errors.
-- It uses **jujutsu (`jj`)** colocated with git. Drive VCS through `jj`.
+- It uses **Git** directly with a feature-branch and pull-request workflow.
 
 ## The happy path (standard single-project init)
 
@@ -96,8 +96,8 @@ nothing structurally unusual, **this is the whole job.** Resist the urge to rede
   writes. Read and ask first; write once you know the answers.
 - **Permission model.** Do not write permission allow-rules into
   `.claude/settings.json` yourself — the self-modification classifier will block it.
-- **VCS.** The repo is jj-colocated. Use `jj` commands; if you must use raw git,
-  follow with `jj git import`.
+- **VCS.** The repo uses Git directly. Keep each task on a focused feature branch
+  and publish it through a pull request into `main`.
 
 ## Keep agent-instruction files local to the new repo
 
@@ -120,10 +120,9 @@ activates `settings.json`). Two facts make it more than a one-line append:
 printf '\n/CLAUDE.md\n/AGENTS.md\n.claude/\n' >> .gitignore
 git rm -r --cached CLAUDE.md AGENTS.md .claude
 git add .gitignore && git commit -m "Keep agent instructions local"
-# jj-colocated: jj file untrack CLAUDE.md AGENTS.md .claude
 ```
 
-Verify with `git status` (or `jj st`): the files must not appear as tracked, and a
+Verify with `git status`: the files must not appear as tracked, and a
 `git push` must not carry them.
 
 **Caveat — files already in the remote's history.** Untrack-and-ignore stops the

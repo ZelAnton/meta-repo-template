@@ -64,7 +64,7 @@ sibling templates** (`rust-repo-template`, `cSharp-repo-template`,
 ## 2. The happy path
 
 1. **Copy** `meta-repo-template` to `…/<lang>-repo-template` (a fresh copy; do not
-   reuse the meta repo's `.git`/`.jj`).
+   reuse the meta repo's `.git` directory).
 2. **Pick the closest sibling** as your reference: JVM/Gradle → Kotlin; .NET → C#
    (or F# for ML-family); native/Cargo-like → Rust.
 3. **Author the build manifest** — see `BUILD-SYSTEM.TODO.md` and section 5. This is
@@ -236,7 +236,7 @@ See `BUILD-SYSTEM.TODO.md` for the per-ecosystem file list. Key points:
   **publish** → atomic push of commit+tag → idempotent GitHub Release. Never move
   the publish after the tag push; keep every post-pivot step idempotent and retried.
 - **Project tokens stay literal.** Filling `%%...%%` must not touch any `__Xxx__`.
-- **Neutral sections stay neutral.** The jujutsu workflow, changelog rules, and the
+- **Neutral sections stay neutral.** The Git workflow, changelog rules, and the
   "agent files are local-only" recipe are shared verbatim across all siblings —
   don't fork them per language.
 - **Actions stay SHA-pinned** with a `# vN` comment; Dependabot maintains them.
@@ -249,7 +249,7 @@ See `BUILD-SYSTEM.TODO.md` for the per-ecosystem file list. Key points:
    rejected metadata leaves the template unchanged, and checks settings activation,
    destination conflicts, exact byte preservation, and repeated runs.
 2. **No stray meta-tokens, markers, or TODOs:** `grep -rnE '%%|META:|TODO\(meta' .`
-   over the finished template returns nothing (ignore `.git`/`.jj`). This single
+   over the finished template returns nothing (ignore `.git`). This single
    pattern catches the `%%Token%%` slots, the `META(%%):` banners, the
    `<!-- META: keep/author … -->` / `<!-- META:start/end -->` markers, and the
    `TODO(meta:)` steps. Separately, `grep -rn '__[A-Za-z]' .` should show *only* the
